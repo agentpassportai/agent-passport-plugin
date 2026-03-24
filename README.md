@@ -1,7 +1,7 @@
 # Agent Passport
 
 Status: draft release candidate  
-Package: `@agentpassport/agent-passport`  
+Package: `@agentholdings/agent-passport`  
 Plugin id: `agent-passport`
 
 Agent Passport is a trust layer for OpenClaw packages and actions.
