@@ -4,6 +4,8 @@ Status: draft release candidate
 Package: `@agentholdings/agent-passport`  
 Plugin id: `agent-passport`
 
+Note: the npm package name and the runtime plugin id are intentionally different. Install from npm with `@agentholdings/agent-passport`, then enable or inspect the plugin as `agent-passport` inside OpenClaw.
+
 Agent Passport is a trust layer for OpenClaw packages and actions.
 
 The core idea is simple:

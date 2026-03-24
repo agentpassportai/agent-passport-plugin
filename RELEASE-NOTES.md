@@ -2,6 +2,8 @@
 
 First draft release of Agent Passport as a native OpenClaw plugin.
 
+Note: the npm package is published as `@agentholdings/agent-passport`, while the runtime plugin id inside OpenClaw is `agent-passport`.
+
 ## Included in this release
 - scanner-first trust for skills, plugins, and package-like artifacts
 - review decisions bound to exact fingerprints
