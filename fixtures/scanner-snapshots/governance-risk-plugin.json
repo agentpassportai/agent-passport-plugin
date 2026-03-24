@@ -1,0 +1,102 @@
+{
+  "scannedPath": "<fixture:governance-risk-plugin>",
+  "fingerprint": "sha256:1e1692b7ec217bc8b5222f038e99026df52b78bb30b424a29fd1cc5ba5837a5d",
+  "targetType": "directory",
+  "targetKind": "plugin",
+  "fileCount": 2,
+  "filesScanned": [
+    "openclaw.plugin.json",
+    "src/index.ts"
+  ],
+  "verdict": "suspicious",
+  "score": 4,
+  "summary": "Suspicious plugin patterns found: plugin-manifest-risk. Current evidence is mainly config signals. Review before trust or enablement.",
+  "packageRecommendation": {
+    "action": "review-before-trust",
+    "reason": "This plugin has findings that need human review before trust (plugin manifest weakens trust defaults)."
+  },
+  "kindSensitiveNotes": [
+    "Plugins have a larger runtime-trust surface. Packaged code, manifests, hooks, and persistence behavior matter more than README-only language.",
+    "This plugin manifest weakens trust or audit defaults. Review the governance posture it ships with, not just the code paths it exposes.",
+    "The strongest current signal is review-before-trust, not immediate blocking."
+  ],
+  "findings": [
+    {
+      "id": "plugin-manifest-risk:openclaw.plugin.json",
+      "category": "plugin-manifest-risk",
+      "severity": "high",
+      "signalType": "config",
+      "title": "Plugin manifest ships risky trust defaults",
+      "summary": "This OpenClaw plugin manifest enables permissive defaults on high-risk surfaces or weakens audit posture, which raises the trust bar before install.",
+      "recommendation": "Review the manifest defaults before trusting the plugin. Prefer require-consent, deny, or audit-forward defaults on risky surfaces.",
+      "evidence": [
+        {
+          "filePath": "openclaw.plugin.json",
+          "line": 1,
+          "snippet": "\"defaultPolicy\": { \"default\": \"allow\" }"
+        },
+        {
+          "filePath": "openclaw.plugin.json",
+          "line": 1,
+          "snippet": "\"exec\": { \"default\": \"allow\" }"
+        },
+        {
+          "filePath": "openclaw.plugin.json",
+          "line": 1,
+          "snippet": "\"privateNetworkAccess\": { \"default\": \"allow\" }"
+        },
+        {
+          "filePath": "openclaw.plugin.json",
+          "line": 1,
+          "snippet": "\"audit\": { \"properties\": { \"enabled\": { \"default\": false } } }"
+        }
+      ]
+    }
+  ],
+  "groupedFindings": [
+    {
+      "id": "openclaw.plugin.json:plugin-manifest-risk",
+      "title": "Plugin manifest weakens trust defaults",
+      "summary": "openclaw.plugin.json sets permissive defaults on risky plugin surfaces or weakens audit posture.",
+      "categories": [
+        "plugin-manifest-risk"
+      ],
+      "signalTypes": [
+        "config"
+      ],
+      "severity": "high",
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The plugin manifest weakens trust defaults, but the risk comes from permissive governance posture rather than automatic payload execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This plugin ships permissive trust defaults or weak audit defaults, so it should be reviewed before trust even without an auto-exec chain.",
+      "representativeFindingId": "plugin-manifest-risk:openclaw.plugin.json",
+      "findingIds": [
+        "plugin-manifest-risk:openclaw.plugin.json"
+      ],
+      "filePaths": [
+        "openclaw.plugin.json"
+      ]
+    }
+  ],
+  "topRisks": [
+    {
+      "title": "Plugin manifest weakens trust defaults",
+      "summary": "openclaw.plugin.json sets permissive defaults on risky plugin surfaces or weakens audit posture.",
+      "severity": "high",
+      "signalTypes": [
+        "config"
+      ],
+      "categories": [
+        "plugin-manifest-risk"
+      ],
+      "filePaths": [
+        "openclaw.plugin.json"
+      ],
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The plugin manifest weakens trust defaults, but the risk comes from permissive governance posture rather than automatic payload execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This plugin ships permissive trust defaults or weak audit defaults, so it should be reviewed before trust even without an auto-exec chain.",
+      "groupId": "openclaw.plugin.json:plugin-manifest-risk"
+    }
+  ]
+}

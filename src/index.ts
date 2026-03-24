@@ -1,0 +1,2994 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { Type } from "@sinclair/typebox";
+import { evaluateAction } from "./policy/engine.js";
+import { evaluateOutboundCommunication } from "./policy/outbound-comms.js";
+import { appendAuditRecord } from "./audit.js";
+import { scanPath } from "./scanner/index.js";
+import type { ScannerFinding, ScannerReport } from "./scanner/types.js";
+import { getLatestScanReview, listScanReviews, recordScanReview, type PassportScanDecision, type PassportScanReview } from "./review.js";
+import { getLatestPluginInstall, listPluginInstalls, markPluginEnabled, recordPluginInstall } from "./install-ledger.js";
+import { getLatestSkillReviewRecord, recordSkillReview } from "./skill-review-ledger.js";
+import { buildDriftAlerts, listPluginsNeedingRereview, sweepRereviewQueue } from "./rereview.js";
+import {
+  createConsentRequest,
+  expandTargetAliases,
+  grantConsent,
+  hasConsentForTarget,
+  listConsentRequests,
+  listConsents,
+  revokeConsent,
+  reviewConsentRequest,
+  type PassportConsentRequest
+} from "./consent.js";
+
+type PassportMode = "audit" | "warn" | "enforce";
+type TrustedPathScope = "all" | "message_sending" | "message.send" | "sessions_send";
+type GuardedScope = Exclude<TrustedPathScope, "all">;
+
+type TrustedTargetRule = {
+  target: string;
+  paths: TrustedPathScope[];
+  note?: string;
+};
+
+type PassportPluginConfig = {
+  mode?: PassportMode;
+  pathModes?: Partial<Record<GuardedScope, PassportMode>>;
+  trustedTargets?: string[];
+  trustedTargetRules?: TrustedTargetRule[];
+  consentTtlMinutes?: number;
+};
+
+type LoadedPluginConfig = {
+  mode: PassportMode;
+  pathModes: Partial<Record<GuardedScope, PassportMode>>;
+  trustedTargets: string[];
+  trustedTargetRules: TrustedTargetRule[];
+  consentTtlMinutes: number;
+};
+
+const GUARDED_SCOPES: GuardedScope[] = ["message_sending", "message.send", "sessions_send"];
+const TELEGRAM_NAMESPACE = "passport";
+
+function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPluginConfig {
+  const trustedTargets = Array.isArray(raw?.trustedTargets)
+    ? raw.trustedTargets.filter((x): x is string => typeof x === "string").map((x) => x.trim().toLowerCase())
+    : [];
+
+  const trustedTargetRules = Array.isArray(raw?.trustedTargetRules)
+    ? raw.trustedTargetRules.flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const target = typeof value.target === "string" ? value.target.trim().toLowerCase() : "";
+        if (!target) return [];
+        const paths = Array.isArray(value.paths)
+          ? value.paths.filter(
+              (path): path is TrustedPathScope =>
+                typeof path === "string" && ["all", "message_sending", "message.send", "sessions_send"].includes(path)
+            )
+          : ["all"];
+        return [{
+          target,
+          paths: paths.length ? paths : ["all"],
+          note: typeof value.note === "string" ? value.note : undefined
+        } satisfies TrustedTargetRule];
+      })
+    : [];
+
+  const pathModes = raw?.pathModes && typeof raw.pathModes === "object"
+    ? Object.fromEntries(
+        Object.entries(raw.pathModes).flatMap(([scope, mode]) => {
+          if (!GUARDED_SCOPES.includes(scope as GuardedScope)) return [];
+          if (mode !== "audit" && mode !== "warn" && mode !== "enforce") return [];
+          return [[scope, mode]];
+        })
+      ) as Partial<Record<GuardedScope, PassportMode>>
+    : {};
+
+  return {
+    mode: raw?.mode === "audit" || raw?.mode === "warn" || raw?.mode === "enforce" ? raw.mode : "warn",
+    pathModes,
+    trustedTargets,
+    trustedTargetRules,
+    consentTtlMinutes: typeof raw?.consentTtlMinutes === "number" && raw?.consentTtlMinutes > 0 ? Math.floor(raw.consentTtlMinutes) : 60
+  };
+}
+
+function shouldGateMessageTool(params: Record<string, unknown>) {
+  const action = String(params.action ?? "").toLowerCase();
+  return action === "send";
+}
+
+function shouldGateSessionSend(toolName: string) {
+  return toolName === "sessions_send";
+}
+
+function normalizeTarget(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function targetMatches(target: string, candidate: string) {
+  const targetAliases = expandTargetAliases(target);
+  const candidateAliases = expandTargetAliases(candidate);
+  for (const alias of targetAliases) {
+    if (candidateAliases.has(alias)) return true;
+  }
+  return false;
+}
+
+function getTrustedMatch(target: string, scope: TrustedPathScope, pluginCfg: LoadedPluginConfig) {
+  if (!target) return null;
+
+  for (const rule of pluginCfg.trustedTargetRules) {
+    if (!rule.paths.includes("all") && !rule.paths.includes(scope)) continue;
+    if (targetMatches(target, rule.target)) {
+      return {
+        matchedRule: "trusted-target-rule",
+        reason: rule.note || `Target matched trustedTargetRules for ${scope}.`
+      };
+    }
+  }
+
+  for (const targetEntry of pluginCfg.trustedTargets) {
+    if (targetMatches(target, targetEntry)) {
+      return {
+        matchedRule: "trusted-target",
+        reason: "Target matched trustedTargets allowlist after alias normalization."
+      };
+    }
+  }
+
+  return null;
+}
+
+function getModeForScope(scope: GuardedScope, pluginCfg: LoadedPluginConfig) {
+  return pluginCfg.pathModes[scope] ?? pluginCfg.mode;
+}
+
+function buildDecisionText(prefix: string, matchedRule: string, mode: string, requestId?: string) {
+  const requestSuffix = requestId ? ` requestId=${requestId}.` : "";
+  return `${prefix} (${matchedRule}, mode=${mode}).${requestSuffix}`;
+}
+
+function summarizeRequest(request: PassportConsentRequest) {
+  return [
+    `- ${request.id}`,
+    `  action: ${request.action}`,
+    `  target: ${request.target}`,
+    `  status: ${request.status}`,
+    request.reason ? `  reason: ${request.reason}` : null,
+    `  requestedAt: ${request.requestedAt}`
+  ].filter(Boolean).join("\n");
+}
+
+function buildRequestButtons(requests: PassportConsentRequest[]) {
+  return {
+    blocks: requests.flatMap((request) => ([
+      { type: "text" as const, text: `${request.id} • ${request.action} • ${request.target}` },
+      {
+        type: "buttons" as const,
+        buttons: [
+          { label: `Approve ${request.id.slice(-4)}`, value: `approve:${request.id}`, style: "success" as const },
+          { label: `Deny ${request.id.slice(-4)}`, value: `deny:${request.id}`, style: "danger" as const }
+        ]
+      }
+    ]))
+  };
+}
+
+function parseInteractivePayload(payload: string | undefined) {
+  const parts = String(payload ?? "").split(":").filter(Boolean);
+  if (parts[0] === TELEGRAM_NAMESPACE) parts.shift();
+  const action = parts[0] ?? "";
+  const requestId = parts[1] ?? "";
+  const target = parts.slice(1).join(":");
+  return { action, requestId, target };
+}
+
+async function buildRequestsReply(status: PassportConsentRequest["status"] | "all" = "pending") {
+  const requests = await listConsentRequests({ status });
+  if (!requests.length) {
+    return {
+      text: `Agent Passport requests (${status}): none.`,
+      interactive: status === "pending" ? {
+        blocks: [{ type: "buttons", buttons: [{ label: "Refresh", value: "requests" }] }]
+      } : undefined
+    };
+  }
+
+  const limited = requests.slice(-5).reverse();
+  const text = [`Agent Passport requests (${status}, newest first):`, ...limited.map((request) => summarizeRequest(request))].join("\n\n");
+  return {
+    text,
+    interactive: status === "pending" ? buildRequestButtons(limited.filter((request) => request.status === "pending")) : undefined
+  };
+}
+
+async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
+  const grants = await listConsents();
+  const pendingRequests = await listConsentRequests({ status: "pending" });
+  const reviews = await listScanReviews();
+  const installs = await listPluginInstalls();
+  const rereviewQueue = await listPluginsNeedingRereview();
+  const skillRereviewQueue = await listSkillsNeedingRereview();
+  const skills = await listSkillStates();
+  const pathLines = GUARDED_SCOPES.map((scope) => `- ${scope}: ${getModeForScope(scope, pluginCfg)}`);
+  return {
+    text: [
+      "Agent Passport status:",
+      `- default mode: ${pluginCfg.mode}`,
+      ...pathLines,
+      `- active grants: ${grants.length}`,
+      `- pending requests: ${pendingRequests.length}`,
+      `- reviewed artifacts: ${reviews.length}`,
+      `- recorded plugin installs: ${installs.length}`,
+      `- tracked skills: ${skills.length}`,
+      `- plugin re-review queue: ${rereviewQueue.length}`,
+      `- skill re-review queue: ${skillRereviewQueue.length}`,
+      `- consent TTL minutes: ${pluginCfg.consentTtlMinutes}`
+    ].join("\n"),
+    interactive: pendingRequests.length
+      ? { blocks: [{ type: "buttons", buttons: [{ label: `Review ${pendingRequests.length} pending`, value: "requests", style: "primary" }] }] }
+      : undefined
+  };
+}
+
+function formatFinding(finding: ScannerFinding) {
+  const evidence = finding.evidence.slice(0, 2).map((item) => `    - ${item.filePath}:${item.line} — ${item.snippet}`);
+  return [
+    `- ${finding.category} [${finding.severity}; ${finding.signalType}]`,
+    `  ${finding.summary}`,
+    `  Recommendation: ${finding.recommendation}`,
+    ...evidence
+  ].join("\n");
+}
+
+function summarizeSignalCounts(findings: ScannerFinding[]) {
+  const counts = {
+    executable: 0,
+    config: 0,
+    documentation: 0
+  };
+  for (const finding of findings) {
+    counts[finding.signalType] += 1;
+  }
+  return counts;
+}
+
+function getFindingPriority(finding: ScannerFinding) {
+  const severityRank = finding.severity === "high" ? 3 : finding.severity === "medium" ? 2 : 1;
+  const signalRank = finding.signalType === "executable" ? 3 : finding.signalType === "config" ? 2 : 1;
+  const categoryBonus = finding.category === "manifest-lifecycle"
+    ? 3
+    : finding.category === "staged-payload" || finding.category === "persistence-autorun"
+      ? 2
+      : 0;
+  return severityRank * 10 + signalRank * 3 + categoryBonus;
+}
+
+function selectFindingsForReply(report: ScannerReport) {
+  const grouped = report.groupedFindings ?? [];
+  const groupedRepresentatives = grouped
+    .map((group) => report.findings.find((finding) => finding.id === group.representativeFindingId))
+    .filter((finding): finding is ScannerFinding => Boolean(finding))
+    .sort((a, b) => getFindingPriority(b) - getFindingPriority(a));
+
+  const executableOrConfig = groupedRepresentatives.filter((finding) => finding.signalType !== "documentation");
+  if (!executableOrConfig.length) return groupedRepresentatives.slice(0, 6);
+
+  const documentation = groupedRepresentatives.filter((finding) => finding.signalType === "documentation");
+  return [...executableOrConfig.slice(0, 5), ...documentation.slice(0, 1)].slice(0, 6);
+}
+
+function buildNarrativeHighlights(report: ScannerReport) {
+  return (report.groupedFindings ?? [])
+    .slice(0, 3)
+    .map((group) => `- ${group.summary} (${group.signalTypes.join(", ")}; ${group.exploitability}; action=${group.recommendedAction})`);
+}
+
+function kindLabelForReply(targetKind: ScannerReport["targetKind"]) {
+  if (targetKind === "skill") return "skill";
+  if (targetKind === "plugin") return "plugin";
+  if (targetKind === "package") return "package";
+  if (targetKind === "hybrid") return "hybrid";
+  return "artifact";
+}
+
+function decisionSummary(decision: PassportScanDecision) {
+  if (decision === "trust") return "trusted";
+  if (decision === "block") return "blocked";
+  return "marked for review";
+}
+
+function buildPreflightDecision(input: { report: ScannerReport; scanReview?: PassportScanReview | null }) {
+  const { report, scanReview } = input;
+  const recommendation = report.packageRecommendation.action;
+  const reviewDecision = scanReview?.decision ?? null;
+
+  if (reviewDecision === "block") {
+    return {
+      allowed: false,
+      disposition: "deny" as const,
+      reason: "This artifact was explicitly blocked by an operator review decision."
+    };
+  }
+
+  if (recommendation === "block-package") {
+    if (reviewDecision === "trust") {
+      return {
+        allowed: true,
+        disposition: "allow-with-override" as const,
+        reason: "This artifact was scanner-blocked by default, but an explicit trust override exists for this exact fingerprint."
+      };
+    }
+    return {
+      allowed: false,
+      disposition: "deny" as const,
+      reason: "Scanner recommendation is block-package. Install or enable should stay blocked unless an explicit trust override is recorded for this exact fingerprint."
+    };
+  }
+
+  if (recommendation === "review-before-trust") {
+    if (reviewDecision === "trust") {
+      return {
+        allowed: true,
+        disposition: "allow" as const,
+        reason: "Scanner required review before trust, and an explicit trust decision exists for this exact fingerprint."
+      };
+    }
+    if (reviewDecision === "review") {
+      return {
+        allowed: true,
+        disposition: "allow-with-review" as const,
+        reason: "Scanner required review before trust, and an explicit human review decision exists for this exact fingerprint."
+      };
+    }
+    return {
+      allowed: false,
+      disposition: "needs-review" as const,
+      reason: "Scanner requires explicit review before trust. Record /passport review <path> or /passport trust <path> before install or enable."
+    };
+  }
+
+  if (reviewDecision === "trust") {
+    return {
+      allowed: true,
+      disposition: "allow" as const,
+      reason: "Artifact is scanner-allowed and has an explicit trust decision recorded."
+    };
+  }
+
+  if (reviewDecision === "review") {
+    return {
+      allowed: true,
+      disposition: "allow-with-review" as const,
+      reason: "Artifact is scanner-allowed, and a review decision is already recorded for this exact fingerprint."
+    };
+  }
+
+  return {
+    allowed: true,
+    disposition: recommendation === "monitor" ? "allow-with-review" as const : "allow" as const,
+    reason: recommendation === "monitor"
+      ? "Scanner posture is monitor. Install or enable can proceed, but keep this artifact under review."
+      : "Scanner posture is allow. Install or enable can proceed unless a later review blocks it."
+  };
+}
+
+function buildSuggestedReviewCommands(report: ScannerReport) {
+  const escapedPath = report.scannedPath.includes(" ") ? `"${report.scannedPath}"` : report.scannedPath;
+  const commands = report.packageRecommendation.action === "allow"
+    ? [`/passport trust ${escapedPath}`]
+    : report.packageRecommendation.action === "block-package"
+      ? [`/passport block ${escapedPath}`, `/passport review ${escapedPath}`]
+      : [`/passport review ${escapedPath}`, `/passport trust ${escapedPath}`];
+  return commands.map((command) => `- ${command}`);
+}
+
+function buildScanReply(report: ScannerReport, scanReview?: PassportScanReview | null) {
+  const signalCounts = summarizeSignalCounts(report.findings);
+  const label = kindLabelForReply(report.targetKind);
+  const highlightedFindings = selectFindingsForReply(report);
+  const findings = report.findings.length
+    ? highlightedFindings.map((finding) => formatFinding(finding)).join("\n\n")
+    : "- No high-signal poisoned-package indicators were found in the scanned files.";
+  const narrativeHighlights = buildNarrativeHighlights(report);
+  const topRisks = (report.topRisks ?? []).slice(0, 3).map((risk, index) => `- ${index + 1}. ${risk.title} [${risk.exploitability}; ${risk.recommendedAction}]: ${risk.summary}`);
+  const kindSensitiveNotes = (report.kindSensitiveNotes ?? []).slice(0, 3).map((note) => `- ${note}`);
+  const suggestedCommands = !scanReview ? buildSuggestedReviewCommands(report) : [];
+  const suppressedCount = Math.max(0, report.groupedFindings.length - highlightedFindings.length);
+
+  return [
+    `Agent Passport scan: ${report.scannedPath}`,
+    `- fingerprint: ${report.fingerprint}`,
+    `- verdict: ${report.verdict}`,
+    `- recommended ${label} action: ${report.packageRecommendation.action}`,
+    `- ${label} action reason: ${report.packageRecommendation.reason}`,
+    ...(scanReview ? [`- current review state: ${decisionSummary(scanReview.decision)} at ${scanReview.createdAt}`] : []),
+    `- score: ${report.score}/10`,
+    `- target type: ${report.targetType}`,
+    `- detected kind: ${report.targetKind}`,
+    `- files scanned: ${report.fileCount}`,
+    `- signals: executable=${signalCounts.executable}, config=${signalCounts.config}, documentation=${signalCounts.documentation}`,
+    `- summary: ${report.summary}`,
+    ...(kindSensitiveNotes.length ? ["", `Why this matters for this ${label}:`, ...kindSensitiveNotes] : []),
+    ...(topRisks.length ? ["", "Top risks:", ...topRisks] : []),
+    ...(narrativeHighlights.length ? ["", "Risk story:", ...narrativeHighlights] : []),
+    ...(suggestedCommands.length ? ["", "Suggested next step:", ...suggestedCommands] : []),
+    "",
+    "Findings:",
+    findings,
+    ...(suppressedCount > 0 ? ["", `- ${suppressedCount} additional lower-priority or documentation-heavy finding(s) suppressed in chat output.`] : [])
+  ].join("\n");
+}
+
+function buildActionSpecificNextSteps(action: "install" | "enable" | "update", report: ScannerReport, scanReview?: PassportScanReview | null, driftChanged = false) {
+  const escapedPath = report.scannedPath.includes(" ") ? `"${report.scannedPath}"` : report.scannedPath;
+  if (driftChanged && action === "enable" && scanReview?.decision !== "trust") {
+    return [
+      `- Deny ${action} for now because the installed source fingerprint drifted.`,
+      `- Re-scan the current source: /passport scan ${escapedPath}`,
+      `- If this new fingerprint is acceptable, explicitly trust it: /passport trust ${escapedPath}`
+    ];
+  }
+  if (scanReview?.decision === "block") {
+    return [`- This ${action} attempt should stay denied until the artifact is re-reviewed.`, `- Re-scan after changes: /passport scan ${escapedPath}`];
+  }
+  if (report.packageRecommendation.action === "block-package" && scanReview?.decision !== "trust") {
+    return [`- Deny ${action}.`, `- If you intentionally want to override for this exact fingerprint: /passport trust ${escapedPath}`];
+  }
+  if (report.packageRecommendation.action === "review-before-trust" && !scanReview) {
+    return [`- Deny ${action} for now.`, `- Record review: /passport review ${escapedPath}`, `- Or explicitly trust: /passport trust ${escapedPath}`];
+  }
+  if (report.packageRecommendation.action === "review-before-trust" && scanReview?.decision === "review") {
+    return [`- ${action[0].toUpperCase() + action.slice(1)} is allowed because a human review decision exists for this fingerprint.`];
+  }
+  if (report.packageRecommendation.action === "block-package" && scanReview?.decision === "trust") {
+    return [`- ${action[0].toUpperCase() + action.slice(1)} is allowed only because an explicit trust override exists for this fingerprint.`];
+  }
+  return [`- ${action[0].toUpperCase() + action.slice(1)} can proceed under current Passport policy.`];
+}
+
+function buildAuthorizationReply(input: {
+  action: "install" | "enable" | "update";
+  report: ScannerReport;
+  scanReview?: PassportScanReview | null;
+  preflight: ReturnType<typeof buildPreflightDecision>;
+  drift?: {
+    changed: boolean;
+    recordedFingerprint: string;
+    currentFingerprint: string;
+    recordedRecommendation: string;
+    currentRecommendation: string;
+    recordedVerdict: string;
+    currentVerdict: string;
+  } | null;
+}) {
+  const { action, report, scanReview, preflight, drift } = input;
+  const nextSteps = buildActionSpecificNextSteps(action, report, scanReview, Boolean(drift?.changed));
+  return [
+    `Agent Passport authorization: ${action} ${report.scannedPath}`,
+    `- allowed now: ${preflight.allowed ? "yes" : "no"}`,
+    `- disposition: ${preflight.disposition}`,
+    `- reason: ${preflight.reason}`,
+    `- scanner recommendation: ${report.packageRecommendation.action}`,
+    ...(scanReview ? [`- review state: ${decisionSummary(scanReview.decision)} at ${scanReview.createdAt}`] : ["- review state: none recorded for this fingerprint"]),
+    ...(drift ? [
+      `- install drift detected: ${drift.changed ? "yes" : "no"}`,
+      ...(drift.changed ? [
+        `- recorded fingerprint: ${drift.recordedFingerprint}`,
+        `- current fingerprint: ${drift.currentFingerprint}`,
+        `- recorded verdict/recommendation: ${drift.recordedVerdict} / ${drift.recordedRecommendation}`,
+        `- current verdict/recommendation: ${drift.currentVerdict} / ${drift.currentRecommendation}`
+      ] : [])
+    ] : []),
+    "",
+    `Next step for ${action}:`,
+    ...nextSteps,
+    "",
+    buildScanReply(report, scanReview)
+  ].join("\n");
+}
+
+function clipOutput(text: string, maxChars = 1200) {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function resolvePluginManifestPath(targetPath: string) {
+  const absolute = resolve(targetPath);
+  const info = await stat(absolute);
+  if (info.isDirectory()) return join(absolute, "openclaw.plugin.json");
+  return absolute;
+}
+
+async function loadOpenClawPluginMetadata(targetPath: string) {
+  const manifestPath = await resolvePluginManifestPath(targetPath);
+  const raw = await readFile(manifestPath, "utf8");
+  const manifest = JSON.parse(raw) as { id?: unknown; name?: unknown };
+  const pluginId = typeof manifest.id === "string" ? manifest.id.trim() : "";
+  if (!pluginId) {
+    throw new Error(`Plugin manifest at ${manifestPath} is missing a valid id.`);
+  }
+  return {
+    manifestPath,
+    pluginId,
+    pluginName: typeof manifest.name === "string" ? manifest.name : pluginId
+  };
+}
+
+function buildRunReply(input: Awaited<ReturnType<typeof runArtifactAction>>) {
+  const base = buildAuthorizationReply(input);
+  if (!input.preflight.allowed) {
+    return [
+      base,
+      "",
+      "Execution: blocked by Passport policy.",
+      `- command not run: ${input.command}`,
+      `- cwd: ${input.cwd}`
+    ].join("\n");
+  }
+
+  if (!input.executed) {
+    return [
+      base,
+      "",
+      "Execution: dry run only.",
+      `- command not run: ${input.command}`,
+      `- cwd: ${input.cwd}`
+    ].join("\n");
+  }
+
+  return [
+    base,
+    "",
+    `Execution: ${input.execution?.ok ? "succeeded" : "failed"}.`,
+    `- command: ${input.command}`,
+    `- cwd: ${input.cwd}`,
+    `- exit code: ${input.execution?.exitCode ?? "null"}`,
+    ...(input.execution?.stdout ? ["", "stdout:", clipOutput(input.execution.stdout)] : []),
+    ...(input.execution?.stderr ? ["", "stderr:", clipOutput(input.execution.stderr)] : [])
+  ].join("\n");
+}
+
+function buildPluginStateReply(input: Awaited<ReturnType<typeof buildPluginState>>) {
+  if (!input.ok || !input.latestInstall || !input.drift) {
+    return `Agent Passport plugin state failed for ${input.pluginId}: ${input.reason}`;
+  }
+
+  return [
+    `Agent Passport plugin state: ${input.pluginId}`,
+    `- state: ${input.state}`,
+    `- reason: ${input.reason}`,
+    `- plugin name: ${input.latestInstall.pluginName}`,
+    `- source: ${input.latestInstall.sourcePath}`,
+    `- install count: ${input.installCount}`,
+    `- installed at: ${input.latestInstall.installedAt}`,
+    `- enabled at: ${input.latestInstall.enabledAt ?? "not recorded"}`,
+    `- recorded review: ${input.latestInstall.reviewDecision ?? "none"}`,
+    `- current review: ${input.currentReview ? decisionSummary(input.currentReview.decision) : "none recorded for current fingerprint"}`,
+    `- recorded fingerprint: ${input.drift.recordedFingerprint}`,
+    `- current fingerprint: ${input.drift.currentFingerprint}`,
+    `- drift changed: ${input.drift.changed ? "yes" : "no"}`,
+    `- recorded verdict/recommendation: ${input.drift.recordedVerdict} / ${input.drift.recordedRecommendation}`,
+    `- current verdict/recommendation: ${input.drift.currentVerdict} / ${input.drift.currentRecommendation}`,
+    "",
+    "Recommended next steps:",
+    ...input.recommendedActions.map((action) => `- ${action}`)
+  ].join("\n");
+}
+
+function summarizeWorkspaceStateCounts<T extends { state: string; ok?: boolean | null }>(items: T[]) {
+  return {
+    total: items.length,
+    trusted: items.filter((item) => item.state === "trusted" || item.state === "trusted-enabled" || item.state === "trusted-installed").length,
+    reviewed: items.filter((item) => item.state === "reviewed").length,
+    blocked: items.filter((item) => item.state === "blocked").length,
+    rereviewRequired: items.filter((item) => item.state === "rereview-required").length,
+    needsReview: items.filter((item) => item.state === "needs-review" || item.state === "dangerous-unreviewed" || item.state === "unreviewed").length,
+    missing: items.filter((item) => item.ok === false || item.state === "missing").length
+  };
+}
+
+export async function buildWorkspaceState() {
+  const pluginInstalls = await listPluginInstalls();
+  const latestPluginIds = [...new Set(pluginInstalls.map((record) => record.pluginId))].sort();
+  const pluginStates = await Promise.all(latestPluginIds.map(async (pluginId) => buildPluginState({ pluginId })));
+  const skillStates = await listSkillStates();
+  const pluginRereview = await listPluginsNeedingRereview();
+  const skillRereview = await listSkillsNeedingRereview();
+
+  return {
+    plugins: {
+      counts: summarizeWorkspaceStateCounts(pluginStates.map((item) => ({ state: item.state ?? "missing", ok: item.ok }))),
+      items: pluginStates
+    },
+    skills: {
+      counts: summarizeWorkspaceStateCounts(skillStates.map((item) => ({ state: item.state, ok: item.ok }))),
+      items: skillStates
+    },
+    attention: {
+      pluginRereview,
+      skillRereview,
+      pluginCount: pluginRereview.length,
+      skillCount: skillRereview.length,
+      total: pluginRereview.length + skillRereview.length
+    }
+  };
+}
+
+function buildWorkspaceStateReply(input: Awaited<ReturnType<typeof buildWorkspaceState>>) {
+  const pluginAttention = input.plugins.items.filter((item) => !item.ok || item.state === "rereview-required" || item.state === "blocked" || item.state === "unreviewed");
+  const skillAttention = input.skills.items.filter((item) => !item.ok || item.state === "rereview-required" || item.state === "blocked" || item.state === "dangerous-unreviewed" || item.state === "needs-review" || item.state === "unreviewed");
+
+  const text = [
+    "Agent Passport workspace state:",
+    `- plugin installs tracked: ${input.plugins.counts.total}`,
+    `- plugins trusted: ${input.plugins.counts.trusted}`,
+    `- plugins reviewed: ${input.plugins.counts.reviewed}`,
+    `- plugins blocked: ${input.plugins.counts.blocked}`,
+    `- plugins needing attention: ${pluginAttention.length}`,
+    `- skills tracked: ${input.skills.counts.total}`,
+    `- skills trusted: ${input.skills.counts.trusted}`,
+    `- skills reviewed: ${input.skills.counts.reviewed}`,
+    `- skills blocked: ${input.skills.counts.blocked}`,
+    `- skills needing attention: ${skillAttention.length}`,
+    `- total re-review queue: ${input.attention.total}`,
+    "",
+    ...(pluginAttention.length ? [
+      "Plugins needing attention:",
+      ...pluginAttention.slice(0, 10).map((item) => `- ${item.pluginId}: ${item.state}${item.ok ? ` (${item.reason})` : ""}`),
+      ""
+    ] : []),
+    ...(skillAttention.length ? [
+      "Skills needing attention:",
+      ...skillAttention.slice(0, 10).map((item) => `- ${item.slug}: ${item.state}${item.installedVersion ? ` (${item.installedVersion})` : ""}`),
+      ""
+    ] : []),
+    "Recommended next steps:",
+    ...(input.attention.pluginCount ? ["- /passport rereview-queue"] : []),
+    ...(input.attention.skillCount ? ["- /passport skills-rereview"] : []),
+    ...(!input.attention.total ? ["- No immediate re-review work. Spot check with /passport skills or /passport plugin-state <id>."] : [])
+  ].join("\n");
+
+  const buttons: { label: string; value: string; style?: "primary" | "secondary" | "success" | "danger" }[][] = [];
+  const topPlugin = pluginAttention.find((item) => item.ok && item.state === "rereview-required") ?? pluginAttention.find((item) => item.ok);
+  const topSkill = skillAttention.find((item) => item.ok && item.state === "rereview-required") ?? skillAttention.find((item) => item.ok);
+
+  buttons.push([{ label: "Refresh workspace", value: "workspace", style: "primary" }]);
+  if (topPlugin?.ok) {
+    buttons.push([
+      { label: `View plugin ${topPlugin.pluginId}`, value: `plugin-state:${topPlugin.pluginId}`, style: "primary" },
+      { label: `Review plugin ${topPlugin.pluginId}`, value: `review-plugin:${topPlugin.pluginId}` },
+      { label: `Trust plugin ${topPlugin.pluginId}`, value: `trust-plugin:${topPlugin.pluginId}`, style: "success" },
+      { label: `Block plugin ${topPlugin.pluginId}`, value: `block-plugin:${topPlugin.pluginId}`, style: "danger" }
+    ]);
+  }
+  if (topSkill?.ok) {
+    buttons.push([
+      { label: `View skill ${topSkill.slug}`, value: `skill-state:${topSkill.slug}`, style: "primary" },
+      { label: `Review skill ${topSkill.slug}`, value: `review-skill:${topSkill.slug}` },
+      { label: `Trust skill ${topSkill.slug}`, value: `trust-skill:${topSkill.slug}`, style: "success" },
+      { label: `Block skill ${topSkill.slug}`, value: `block-skill:${topSkill.slug}`, style: "danger" }
+    ]);
+  }
+
+  return {
+    text,
+    interactive: buttons.length ? { blocks: buttons.map((row) => ({ type: "buttons" as const, buttons: row })) } : undefined
+  };
+}
+
+async function buildArtifactPreflight(targetPath: string) {
+  const report = await scanPath(targetPath);
+  const scanReview = await getLatestScanReview(report.fingerprint);
+  const preflight = buildPreflightDecision({ report, scanReview });
+  return { report, scanReview, preflight };
+}
+
+async function buildArtifactAuthorization(input: { action: "install" | "enable" | "update"; targetPath: string }) {
+  const result = await buildArtifactPreflight(input.targetPath);
+  let drift: {
+    changed: boolean;
+    recordedFingerprint: string;
+    currentFingerprint: string;
+    recordedRecommendation: string;
+    currentRecommendation: string;
+    recordedVerdict: string;
+    currentVerdict: string;
+  } | null = null;
+
+  if (input.action === "enable" || input.action === "update") {
+    try {
+      const metadata = await loadOpenClawPluginMetadata(input.targetPath);
+      const record = await getLatestPluginInstall({ pluginId: metadata.pluginId });
+      if (record) {
+        drift = {
+          changed: result.report.fingerprint !== record.fingerprint,
+          recordedFingerprint: record.fingerprint,
+          currentFingerprint: result.report.fingerprint,
+          recordedRecommendation: record.recommendationAction,
+          currentRecommendation: result.report.packageRecommendation.action,
+          recordedVerdict: record.verdict,
+          currentVerdict: result.report.verdict
+        };
+
+        if (drift.changed && result.scanReview?.decision !== "trust") {
+          result.preflight = {
+            allowed: false,
+            disposition: "needs-review",
+            reason: `Recorded install fingerprint for plugin ${metadata.pluginId} no longer matches this source path. Re-trust the new fingerprint before enable.`
+          };
+        }
+      }
+    } catch {
+      // If we cannot derive plugin metadata here, fall back to plain artifact policy.
+    }
+  }
+
+  return { action: input.action, ...result, drift };
+}
+
+async function resolveArtifactCommandCwd(targetPath: string) {
+  const absolute = resolve(targetPath);
+  try {
+    const info = await stat(absolute);
+    return info.isDirectory() ? absolute : dirname(absolute);
+  } catch {
+    return dirname(absolute);
+  }
+}
+
+async function runShellCommand(command: string, cwd: string) {
+  return await new Promise<{
+    ok: boolean;
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+  }>((resolvePromise) => {
+    const child = spawn("/bin/sh", ["-lc", command], {
+      cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    child.on("close", (exitCode) => {
+      resolvePromise({
+        ok: exitCode === 0,
+        exitCode,
+        stdout,
+        stderr
+      });
+    });
+
+    child.on("error", (error) => {
+      stderr += error instanceof Error ? error.message : String(error);
+      resolvePromise({
+        ok: false,
+        exitCode: null,
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
+async function runArtifactAction(input: {
+  action: "install" | "enable" | "update";
+  targetPath: string;
+  command: string;
+  dryRun?: boolean;
+}) {
+  const authorization = await buildArtifactAuthorization({ action: input.action, targetPath: input.targetPath });
+  if (!authorization.preflight.allowed || input.dryRun) {
+    return {
+      ...authorization,
+      executed: false,
+      execution: null,
+      command: input.command,
+      cwd: await resolveArtifactCommandCwd(input.targetPath)
+    };
+  }
+
+  const cwd = await resolveArtifactCommandCwd(input.targetPath);
+  const execution = await runShellCommand(input.command, cwd);
+  return {
+    ...authorization,
+    executed: true,
+    execution,
+    command: input.command,
+    cwd
+  };
+}
+
+async function installOpenClawPluginFromPath(input: {
+  path: string;
+  link?: boolean;
+  pin?: boolean;
+  enableAfterInstall?: boolean;
+  dryRun?: boolean;
+}) {
+  const absolutePath = resolve(input.path);
+  const metadata = await loadOpenClawPluginMetadata(absolutePath);
+  const flags = [
+    input.link ? "--link" : null,
+    input.pin ? "--pin" : null
+  ].filter(Boolean).join(" ");
+  const installCommand = `openclaw plugins install ${flags ? `${flags} ` : ""}${shellQuote(absolutePath)}`;
+  const installResult = await runArtifactAction({
+    action: "install",
+    targetPath: absolutePath,
+    command: installCommand,
+    dryRun: input.dryRun
+  });
+
+  let installRecord = null;
+  if (installResult.executed && installResult.execution?.ok) {
+    installRecord = await recordPluginInstall({
+      pluginId: metadata.pluginId,
+      pluginName: metadata.pluginName,
+      sourcePath: absolutePath,
+      manifestPath: metadata.manifestPath,
+      report: installResult.report,
+      scanReview: installResult.scanReview,
+      installCommand,
+      linked: Boolean(input.link),
+      pinned: Boolean(input.pin)
+    });
+  }
+
+  if (!input.enableAfterInstall) {
+    return {
+      pluginId: metadata.pluginId,
+      pluginName: metadata.pluginName,
+      install: installResult,
+      installRecord,
+      enable: null
+    };
+  }
+
+  const enableCommand = `openclaw plugins enable ${shellQuote(metadata.pluginId)}`;
+  const enableResult = await runArtifactAction({
+    action: "enable",
+    targetPath: absolutePath,
+    command: enableCommand,
+    dryRun: input.dryRun || !installResult.executed || !installResult.execution?.ok
+  });
+
+  let enabledRecord = null;
+  if (enableResult.executed && enableResult.execution?.ok) {
+    enabledRecord = await markPluginEnabled({ pluginId: metadata.pluginId });
+  }
+
+  return {
+    pluginId: metadata.pluginId,
+    pluginName: metadata.pluginName,
+    install: installResult,
+    installRecord,
+    enable: enableResult,
+    enabledRecord
+  };
+}
+
+async function enableOpenClawPluginFromPath(input: {
+  path: string;
+  dryRun?: boolean;
+}) {
+  const absolutePath = resolve(input.path);
+  const metadata = await loadOpenClawPluginMetadata(absolutePath);
+  const enableCommand = `openclaw plugins enable ${shellQuote(metadata.pluginId)}`;
+  const enableResult = await runArtifactAction({
+    action: "enable",
+    targetPath: absolutePath,
+    command: enableCommand,
+    dryRun: input.dryRun
+  });
+  const enabledRecord = enableResult.executed && enableResult.execution?.ok
+    ? await markPluginEnabled({ pluginId: metadata.pluginId })
+    : null;
+  return {
+    pluginId: metadata.pluginId,
+    pluginName: metadata.pluginName,
+    manifestPath: metadata.manifestPath,
+    enable: enableResult,
+    enabledRecord
+  };
+}
+
+async function updateOpenClawPluginFromLedger(input: {
+  pluginId: string;
+  dryRun?: boolean;
+}) {
+  const record = await getLatestPluginInstall({ pluginId: input.pluginId });
+  if (!record) {
+    throw new Error(`No recorded Passport install found for plugin ${input.pluginId}.`);
+  }
+
+  const updateCommand = `openclaw plugins update ${shellQuote(record.pluginId)}`;
+  const updateResult = await runArtifactAction({
+    action: "update",
+    targetPath: record.sourcePath,
+    command: updateCommand,
+    dryRun: input.dryRun
+  });
+
+  let updatedRecord = null;
+  if (updateResult.executed && updateResult.execution?.ok) {
+    updatedRecord = await recordPluginInstall({
+      pluginId: record.pluginId,
+      pluginName: record.pluginName,
+      sourcePath: record.sourcePath,
+      manifestPath: record.manifestPath,
+      report: updateResult.report,
+      scanReview: updateResult.scanReview,
+      installCommand: updateCommand,
+      linked: record.linked,
+      pinned: record.pinned,
+      enabledAt: record.enabledAt
+    });
+  }
+
+  return {
+    pluginId: record.pluginId,
+    pluginName: record.pluginName,
+    sourcePath: record.sourcePath,
+    update: updateResult,
+    updatedRecord
+  };
+}
+
+export async function updateOpenClawSkill(input: {
+  slug: string;
+  dryRun?: boolean;
+}) {
+  const slug = input.slug.trim();
+  if (!slug) {
+    throw new Error("Skill slug is required.");
+  }
+
+  const tracked = (await readTrackedSkillLock()).skills[slug] ?? null;
+  const origin = await readTrackedSkillOrigin(slug);
+  if (!tracked && !origin) {
+    throw new Error(`Skill ${slug} is not tracked as a ClawHub-installed workspace skill.`);
+  }
+
+  const skillDir = resolveWorkspaceSkillDir(slug);
+  const beforeState = await buildSkillState({ slug });
+  const updateCommand = `openclaw skills update ${shellQuote(slug)}`;
+
+  if (input.dryRun) {
+    return {
+      slug,
+      skillDir,
+      updateCommand,
+      executed: false,
+      execution: null,
+      beforeState,
+      afterState: null,
+      drift: null
+    };
+  }
+
+  const execution = await runShellCommand(updateCommand, getWorkspaceRoot());
+  const afterState = execution.ok ? await buildSkillState({ slug }) : null;
+  const drift = execution.ok ? await checkSkillDrift({ slug }) : null;
+
+  return {
+    slug,
+    skillDir,
+    updateCommand,
+    executed: true,
+    execution,
+    beforeState,
+    afterState,
+    drift
+  };
+}
+
+export async function updateAllOpenClawSkills(input?: {
+  dryRun?: boolean;
+}) {
+  const slugs = await listTrackedSkillSlugs();
+  const beforeStates = await Promise.all(slugs.map(async (slug) => [slug, await buildSkillState({ slug })] as const));
+  const updateCommand = "openclaw skills update --all";
+
+  if (input?.dryRun) {
+    return {
+      slugs,
+      updateCommand,
+      executed: false,
+      execution: null,
+      beforeStates,
+      afterStates: null,
+      summary: {
+        trackedCount: slugs.length,
+        changedCount: 0,
+        trustedCount: 0,
+        reviewedCount: 0,
+        blockedCount: 0,
+        rereviewRequiredCount: 0,
+        missingCount: beforeStates.filter(([, state]) => !state.ok || state.state === "missing").length
+      }
+    };
+  }
+
+  const execution = await runShellCommand(updateCommand, getWorkspaceRoot());
+  const afterStates = execution.ok
+    ? await Promise.all(slugs.map(async (slug) => [slug, await buildSkillState({ slug })] as const))
+    : null;
+
+  const beforeMap = new Map(beforeStates);
+  const afterMap = new Map(afterStates ?? []);
+  const changedCount = afterStates
+    ? slugs.filter((slug) => {
+        const before = beforeMap.get(slug);
+        const after = afterMap.get(slug);
+        return Boolean(before?.fingerprint && after?.fingerprint && before.fingerprint !== after.fingerprint);
+      }).length
+    : 0;
+
+  const states = (afterStates ?? beforeStates).map(([, state]) => state);
+  const summary = {
+    trackedCount: slugs.length,
+    changedCount,
+    trustedCount: states.filter((state) => state.state === "trusted").length,
+    reviewedCount: states.filter((state) => state.state === "reviewed").length,
+    blockedCount: states.filter((state) => state.state === "blocked").length,
+    rereviewRequiredCount: states.filter((state) => state.state === "rereview-required").length,
+    missingCount: states.filter((state) => !state.ok || state.state === "missing").length
+  };
+
+  return {
+    slugs,
+    updateCommand,
+    executed: true,
+    execution,
+    beforeStates,
+    afterStates,
+    summary
+  };
+}
+
+type TrackedSkillLock = {
+  version: 1;
+  skills: Record<string, { version?: string; installedAt?: number }>;
+};
+
+type TrackedSkillOrigin = {
+  version: 1;
+  registry: string;
+  slug: string;
+  installedVersion: string;
+  installedAt: number;
+};
+
+function getWorkspaceRoot() {
+  const explicit = process.env.OPENCLAW_WORKSPACE_DIR?.trim();
+  if (explicit) return resolve(explicit);
+
+  let current = resolve(process.cwd());
+  for (let i = 0; i < 8; i += 1) {
+    if (existsSync(resolve(current, ".clawhub", "lock.json")) || existsSync(resolve(current, "AGENTS.md"))) {
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return process.cwd();
+}
+
+function resolveWorkspaceSkillDir(slug: string) {
+  return resolve(getWorkspaceRoot(), "skills", slug);
+}
+
+async function readTrackedSkillLock(): Promise<TrackedSkillLock> {
+  try {
+    const raw = JSON.parse(await readFile(resolve(getWorkspaceRoot(), ".clawhub", "lock.json"), "utf8")) as Partial<TrackedSkillLock>;
+    return {
+      version: 1,
+      skills: raw.skills && typeof raw.skills === "object" ? raw.skills : {}
+    };
+  } catch {
+    return { version: 1, skills: {} };
+  }
+}
+
+async function readTrackedSkillOrigin(slug: string): Promise<TrackedSkillOrigin | null> {
+  try {
+    const raw = JSON.parse(await readFile(resolve(resolveWorkspaceSkillDir(slug), ".clawhub", "origin.json"), "utf8")) as Partial<TrackedSkillOrigin>;
+    if (raw.version === 1 && typeof raw.registry === "string" && typeof raw.slug === "string" && typeof raw.installedVersion === "string" && typeof raw.installedAt === "number") {
+      return raw as TrackedSkillOrigin;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function listTrackedSkillSlugs() {
+  const lock = await readTrackedSkillLock();
+  return Object.keys(lock.skills).sort();
+}
+
+export async function checkSkillDrift(input: { slug: string }) {
+  const slug = input.slug.trim();
+  const baseline = await getLatestSkillReviewRecord(slug);
+  const skillDir = resolveWorkspaceSkillDir(slug);
+  const origin = await readTrackedSkillOrigin(slug);
+  const tracked = (await readTrackedSkillLock()).skills[slug] ?? null;
+
+  if (!baseline) {
+    return {
+      slug,
+      ok: false,
+      reason: "No Passport skill review baseline found for that slug.",
+      skillDir,
+      installedVersion: origin?.installedVersion ?? tracked?.version ?? null,
+      baseline: null,
+      currentReport: null,
+      currentReview: null,
+      drift: null
+    };
+  }
+
+  const currentReport = await scanPath(skillDir);
+  const currentReview = await getLatestScanReview(currentReport.fingerprint);
+  const drift = {
+    changed: currentReport.fingerprint !== baseline.fingerprint,
+    recordedFingerprint: baseline.fingerprint,
+    currentFingerprint: currentReport.fingerprint,
+    recordedRecommendation: baseline.recommendationAction,
+    currentRecommendation: currentReport.packageRecommendation.action,
+    recordedVerdict: baseline.verdict,
+    currentVerdict: currentReport.verdict
+  };
+
+  return {
+    slug,
+    ok: true,
+    reason: drift.changed
+      ? "Installed skill fingerprint drifted since the last Passport skill review."
+      : "Installed skill fingerprint still matches the last Passport skill review.",
+    skillDir,
+    installedVersion: origin?.installedVersion ?? tracked?.version ?? null,
+    baseline,
+    currentReport,
+    currentReview,
+    drift
+  };
+}
+
+export async function buildSkillState(input: { slug: string }) {
+  const slug = input.slug.trim();
+  const lock = await readTrackedSkillLock();
+  const tracked = lock.skills[slug] ?? null;
+  const skillDir = resolveWorkspaceSkillDir(slug);
+  const origin = await readTrackedSkillOrigin(slug);
+  const baseline = await getLatestSkillReviewRecord(slug);
+
+  try {
+    const report = await scanPath(skillDir);
+    const scanReview = await getLatestScanReview(report.fingerprint);
+    const drift = baseline ? {
+      changed: report.fingerprint !== baseline.fingerprint,
+      recordedFingerprint: baseline.fingerprint,
+      currentFingerprint: report.fingerprint,
+      recordedRecommendation: baseline.recommendationAction,
+      currentRecommendation: report.packageRecommendation.action,
+      recordedVerdict: baseline.verdict,
+      currentVerdict: report.verdict
+    } : null;
+    let state = "unreviewed";
+    const recommendedActions: string[] = [
+      `/passport scan ${skillDir}`
+    ];
+
+    if (drift?.changed && scanReview?.decision !== "trust") {
+      state = "rereview-required";
+      recommendedActions.push(`/passport review-skill ${slug}`);
+      recommendedActions.push(`/passport trust-skill ${slug}`);
+      recommendedActions.push(`/passport block-skill ${slug}`);
+      recommendedActions.push(`/passport drift-skill ${slug}`);
+    } else if (scanReview?.decision === "trust") {
+      state = "trusted";
+      recommendedActions.push(`/passport skill-state ${slug}`);
+    } else if (scanReview?.decision === "review") {
+      state = "reviewed";
+      recommendedActions.push(`/passport trust-skill ${slug}`);
+      recommendedActions.push(`/passport block-skill ${slug}`);
+    } else if (scanReview?.decision === "block") {
+      state = "blocked";
+      recommendedActions.push(`/passport skill-state ${slug}`);
+    } else if (report.packageRecommendation.action === "block-package") {
+      state = "dangerous-unreviewed";
+      recommendedActions.push(`/passport block-skill ${slug}`);
+      recommendedActions.push(`/passport review-skill ${slug}`);
+    } else {
+      state = report.packageRecommendation.action === "review-before-trust" ? "needs-review" : "unreviewed";
+      recommendedActions.push(`/passport review-skill ${slug}`);
+      recommendedActions.push(`/passport trust-skill ${slug}`);
+      recommendedActions.push(`/passport block-skill ${slug}`);
+    }
+
+    return {
+      slug,
+      ok: true,
+      tracked: Boolean(tracked || origin),
+      state,
+      skillDir,
+      installedVersion: origin?.installedVersion ?? tracked?.version ?? null,
+      installedAt: origin?.installedAt ?? tracked?.installedAt ?? null,
+      registry: origin?.registry ?? null,
+      fingerprint: report.fingerprint,
+      verdict: report.verdict,
+      recommendation: report.packageRecommendation.action,
+      currentReview: scanReview ?? null,
+      baseline,
+      drift,
+      recommendedActions
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      slug,
+      ok: false,
+      tracked: Boolean(tracked || origin),
+      state: "missing",
+      skillDir,
+      installedVersion: origin?.installedVersion ?? tracked?.version ?? null,
+      installedAt: origin?.installedAt ?? tracked?.installedAt ?? null,
+      registry: origin?.registry ?? null,
+      fingerprint: null,
+      verdict: null,
+      recommendation: null,
+      currentReview: null,
+      baseline,
+      drift: null,
+      recommendedActions: [],
+      reason: message
+    };
+  }
+}
+
+function buildSkillStateReply(input: Awaited<ReturnType<typeof buildSkillState>>) {
+  if (!input.ok) {
+    return [
+      `Agent Passport skill state: ${input.slug}`,
+      `- state: ${input.state}`,
+      `- tracked: ${input.tracked ? "yes" : "no"}`,
+      `- skill dir: ${input.skillDir}`,
+      `- installed version: ${input.installedVersion ?? "unknown"}`,
+      `- reason: ${input.reason ?? "unavailable"}`
+    ].join("\n");
+  }
+
+  return [
+    `Agent Passport skill state: ${input.slug}`,
+    `- state: ${input.state}`,
+    `- tracked: ${input.tracked ? "yes" : "no"}`,
+    `- skill dir: ${input.skillDir}`,
+    `- installed version: ${input.installedVersion ?? "unknown"}`,
+    `- installed at: ${input.installedAt ? new Date(input.installedAt).toISOString() : "unknown"}`,
+    `- registry: ${input.registry ?? "unknown"}`,
+    `- fingerprint: ${input.fingerprint}`,
+    `- verdict/recommendation: ${input.verdict} / ${input.recommendation}`,
+    `- current review: ${input.currentReview ? decisionSummary(input.currentReview.decision) : "none recorded for current fingerprint"}`,
+    ...(input.baseline ? [
+      `- last skill review fingerprint: ${input.baseline.fingerprint}`,
+      `- last skill review decision: ${decisionSummary(input.baseline.decision)}`,
+      `- skill drift changed: ${input.drift?.changed ? "yes" : "no"}`
+    ] : ["- last skill review fingerprint: none recorded"]),
+    ...(input.drift?.changed ? [
+      `- recorded verdict/recommendation: ${input.drift.recordedVerdict} / ${input.drift.recordedRecommendation}`,
+      `- current verdict/recommendation: ${input.drift.currentVerdict} / ${input.drift.currentRecommendation}`
+    ] : []),
+    "",
+    "Recommended next steps:",
+    ...input.recommendedActions.map((action) => `- ${action}`)
+  ].join("\n");
+}
+
+async function listSkillStates() {
+  const slugs = await listTrackedSkillSlugs();
+  const results = [] as Awaited<ReturnType<typeof buildSkillState>>[];
+  for (const slug of slugs) {
+    results.push(await buildSkillState({ slug }));
+  }
+  return results;
+}
+
+export async function listSkillsNeedingRereview() {
+  const states = await listSkillStates();
+  return states
+    .filter((item) => item.ok && item.state === "rereview-required" && item.drift)
+    .map((item) => ({
+      slug: item.slug,
+      skillDir: item.skillDir,
+      installedVersion: item.installedVersion,
+      recordedFingerprint: item.drift!.recordedFingerprint,
+      currentFingerprint: item.drift!.currentFingerprint,
+      recordedRecommendation: item.drift!.recordedRecommendation,
+      currentRecommendation: item.drift!.currentRecommendation,
+      currentReviewDecision: item.currentReview?.decision ?? null,
+      reason: "Installed skill fingerprint drifted and the new fingerprint is not explicitly trusted."
+    }));
+}
+
+export async function applySkillDecision(input: {
+  slug: string;
+  decision: PassportScanDecision;
+  senderId?: string;
+  note?: string;
+}) {
+  const slug = input.slug.trim();
+  const skillDir = resolveWorkspaceSkillDir(slug);
+  const result = await applyScanDecision({
+    targetPath: skillDir,
+    decision: input.decision,
+    senderId: input.senderId,
+    note: input.note ?? `Recorded via skill slug ${slug}`
+  });
+  const origin = await readTrackedSkillOrigin(slug);
+  await recordSkillReview({
+    slug,
+    skillDir,
+    installedVersion: origin?.installedVersion ?? null,
+    review: result.review
+  });
+  return result;
+}
+
+async function checkPluginInstallDrift(input: { pluginId: string }) {
+  const record = await getLatestPluginInstall({ pluginId: input.pluginId });
+  if (!record) {
+    return {
+      pluginId: input.pluginId,
+      ok: false,
+      reason: "No recorded Passport install found for that plugin id.",
+      record: null,
+      currentReport: null,
+      currentReview: null,
+      drift: null
+    };
+  }
+
+  const currentReport = await scanPath(record.sourcePath);
+  const currentReview = await getLatestScanReview(currentReport.fingerprint);
+  const drift = {
+    changed: currentReport.fingerprint !== record.fingerprint,
+    recordedFingerprint: record.fingerprint,
+    currentFingerprint: currentReport.fingerprint,
+    recordedRecommendation: record.recommendationAction,
+    currentRecommendation: currentReport.packageRecommendation.action,
+    recordedVerdict: record.verdict,
+    currentVerdict: currentReport.verdict
+  };
+
+  return {
+    pluginId: record.pluginId,
+    ok: true,
+    reason: drift.changed
+      ? "Source artifact fingerprint drifted since the recorded install."
+      : "Source artifact fingerprint still matches the recorded install.",
+    record,
+    currentReport,
+    currentReview,
+    drift
+  };
+}
+
+export async function applyPluginDecision(input: {
+  pluginId: string;
+  decision: PassportScanDecision;
+  senderId?: string;
+  note?: string;
+}) {
+  const pluginId = input.pluginId.trim();
+  const record = await getLatestPluginInstall({ pluginId });
+  if (!record) {
+    throw new Error(`No recorded Passport install found for plugin ${pluginId}.`);
+  }
+  return await applyScanDecision({
+    targetPath: record.sourcePath,
+    decision: input.decision,
+    senderId: input.senderId,
+    note: input.note ?? `Recorded via plugin id ${pluginId}`
+  });
+}
+
+export async function buildPluginState(input: { pluginId: string }) {
+  const installs = await listPluginInstalls({ pluginId: input.pluginId });
+  if (!installs.length) {
+    return {
+      pluginId: input.pluginId,
+      ok: false,
+      reason: "No recorded Passport install found for that plugin id.",
+      latestInstall: null,
+      installCount: 0,
+      drift: null,
+      currentReview: null,
+      state: null,
+      recommendedActions: [] as string[]
+    };
+  }
+
+  const driftCheck = await checkPluginInstallDrift({ pluginId: input.pluginId });
+  if (!driftCheck.ok || !driftCheck.record || !driftCheck.currentReport) {
+    return {
+      pluginId: input.pluginId,
+      ok: false,
+      reason: driftCheck.reason,
+      latestInstall: null,
+      installCount: installs.length,
+      drift: null,
+      currentReview: null,
+      state: null,
+      recommendedActions: [] as string[]
+    };
+  }
+
+  const latestInstall = driftCheck.record;
+  const currentReview = driftCheck.currentReview;
+  const drift = driftCheck.drift!;
+  const sourcePath = latestInstall.sourcePath;
+  const recommendedActions: string[] = [];
+  let state = "healthy";
+
+  if (drift.changed && currentReview?.decision !== "trust") {
+    state = "rereview-required";
+    recommendedActions.push(`/passport scan ${sourcePath}`);
+    recommendedActions.push(`/passport review-plugin ${input.pluginId}`);
+    recommendedActions.push(`/passport trust-plugin ${input.pluginId}`);
+    recommendedActions.push(`/passport block-plugin ${input.pluginId}`);
+  } else if (drift.changed && currentReview?.decision === "trust") {
+    state = "drift-trusted";
+    recommendedActions.push(`/passport update-plugin ${input.pluginId} --dry-run`);
+  } else if (currentReview?.decision === "block") {
+    state = "blocked";
+    recommendedActions.push(`/passport plugin-state ${input.pluginId}`);
+  } else if (currentReview?.decision === "review") {
+    state = "reviewed";
+    recommendedActions.push(`/passport trust-plugin ${input.pluginId}`);
+    recommendedActions.push(`/passport block-plugin ${input.pluginId}`);
+  } else if (currentReview?.decision === "trust") {
+    state = latestInstall.enabledAt ? "trusted-enabled" : "trusted-installed";
+    if (!latestInstall.enabledAt) {
+      recommendedActions.push(`/passport enable-plugin ${sourcePath} --dry-run`);
+    }
+    recommendedActions.push(`/passport update-plugin ${input.pluginId} --dry-run`);
+  } else {
+    state = "unreviewed";
+    recommendedActions.push(`/passport review-plugin ${input.pluginId}`);
+    recommendedActions.push(`/passport trust-plugin ${input.pluginId}`);
+    recommendedActions.push(`/passport block-plugin ${input.pluginId}`);
+  }
+
+  recommendedActions.push(`/passport drift-plugin ${input.pluginId}`);
+
+  return {
+    pluginId: input.pluginId,
+    ok: true,
+    reason: driftCheck.reason,
+    latestInstall,
+    installCount: installs.length,
+    drift,
+    currentReview,
+    state,
+    recommendedActions
+  };
+}
+
+async function applyScanDecision(input: {
+  targetPath: string;
+  decision: PassportScanDecision;
+  note?: string;
+  senderId?: string;
+}) {
+  const report = await scanPath(input.targetPath);
+  const review = await recordScanReview({
+    report,
+    decision: input.decision,
+    note: input.note
+  });
+  await appendAuditRecord({
+    kind: "scan_review",
+    senderId: input.senderId,
+    targetPath: input.targetPath,
+    review,
+    report
+  });
+  return { report, review };
+}
+
+async function handleConsentRequired(input: {
+  api: Parameters<NonNullable<ReturnType<typeof definePluginEntry>["register"]>>[0];
+  scope: GuardedScope;
+  target: string;
+  decision: ReturnType<typeof evaluateOutboundCommunication>;
+  pluginCfg: LoadedPluginConfig;
+  auditRecord: Record<string, unknown>;
+}) {
+  const { api, scope, target, decision, pluginCfg, auditRecord } = input;
+  const effectiveMode = getModeForScope(scope, pluginCfg);
+  const request = await createConsentRequest({
+    target,
+    action: scope,
+    reason: decision.reason
+  });
+
+  await appendAuditRecord({
+    ...auditRecord,
+    decision,
+    scope,
+    mode: effectiveMode,
+    globalMode: pluginCfg.mode,
+    effectiveMode,
+    consentRequestId: request.id
+  });
+
+  if (effectiveMode === "audit") return;
+  if (effectiveMode === "warn") {
+    api.logger.warn?.(`agent-passport: ${scope} would require consent for ${target} (${decision.matchedRule}, request=${request.id})`);
+    return;
+  }
+
+  return {
+    block: true,
+    blockReason: buildDecisionText("Agent Passport blocked outbound action pending explicit consent", decision.matchedRule, effectiveMode, request.id)
+  };
+}
+
+export default definePluginEntry({
+  id: "agent-passport",
+  name: "Agent Passport",
+  description: "Scanner-first trust layer for poisoned skills, plugins, drift review, runtime policy checks, and audit logging in OpenClaw",
+  register(api) {
+    const currentConfig = () => getPluginConfig((api.pluginConfig ?? {}) as Record<string, unknown>);
+
+    api.on("message_sending", async (event, ctx) => {
+      const pluginCfg = currentConfig();
+      const target = normalizeTarget(event.to);
+      const trustedMatch = getTrustedMatch(target, "message_sending", pluginCfg);
+
+      if (trustedMatch) {
+        await appendAuditRecord({
+          kind: "message_sending",
+          channelId: ctx.channelId,
+          conversationId: ctx.conversationId,
+          event,
+          decision: {
+            outcome: "allow",
+            severity: "low",
+            category: "externalMessaging",
+            reason: trustedMatch.reason,
+            matchedRule: trustedMatch.matchedRule
+          }
+        });
+        return;
+      }
+
+      if (await hasConsentForTarget(target)) {
+        await appendAuditRecord({
+          kind: "message_sending",
+          channelId: ctx.channelId,
+          conversationId: ctx.conversationId,
+          event,
+          decision: {
+            outcome: "allow",
+            severity: "low",
+            category: "externalMessaging",
+            reason: "Active consent grant found for outbound target.",
+            matchedRule: "active-consent"
+          }
+        });
+        return;
+      }
+
+      const decision = evaluateOutboundCommunication({
+        to: event.to,
+        content: event.content,
+        target
+      });
+
+      const result = await handleConsentRequired({
+        api,
+        scope: "message_sending",
+        target,
+        decision,
+        pluginCfg,
+        auditRecord: {
+          kind: "message_sending",
+          channelId: ctx.channelId,
+          conversationId: ctx.conversationId,
+          event
+        }
+      });
+
+      if (getModeForScope("message_sending", pluginCfg) === "enforce" && (decision.outcome === "deny" || decision.outcome === "require_consent")) {
+        api.logger.info?.(`agent-passport: cancelled outbound send to ${event.to} via message_sending hook (${decision.matchedRule})`);
+        return { cancel: true };
+      }
+
+      return result;
+    });
+
+    api.on("before_tool_call", async (event, ctx) => {
+      const pluginCfg = currentConfig();
+      const toolName = event.toolName;
+      const params = event.params ?? {};
+
+      if (toolName === "message" && shouldGateMessageTool(params)) {
+        const target = normalizeTarget(params.target ?? params.to);
+        const trustedMatch = getTrustedMatch(target, "message.send", pluginCfg);
+
+        if (trustedMatch || await hasConsentForTarget(target)) {
+          await appendAuditRecord({
+            kind: "before_tool_call",
+            toolName,
+            event,
+            context: ctx,
+            decision: {
+              outcome: "allow",
+              severity: "low",
+              category: "externalMessaging",
+              reason: trustedMatch?.reason || "Active consent grant found for outbound target.",
+              matchedRule: trustedMatch?.matchedRule || "active-consent"
+            }
+          });
+          return;
+        }
+
+        const decision = evaluateOutboundCommunication({
+          target,
+          content: String(params.message ?? "")
+        });
+
+        return handleConsentRequired({
+          api,
+          scope: "message.send",
+          target,
+          decision,
+          pluginCfg,
+          auditRecord: { kind: "before_tool_call", toolName, event, context: ctx }
+        });
+      }
+
+      if (shouldGateSessionSend(toolName)) {
+        const target = normalizeTarget(params.sessionKey ?? params.label);
+        const trustedMatch = getTrustedMatch(target, "sessions_send", pluginCfg);
+
+        if (trustedMatch || await hasConsentForTarget(target)) {
+          await appendAuditRecord({
+            kind: "before_tool_call",
+            toolName,
+            event,
+            context: ctx,
+            decision: {
+              outcome: "allow",
+              severity: "low",
+              category: "externalMessaging",
+              reason: trustedMatch?.reason || "Active consent grant found for cross-session send.",
+              matchedRule: trustedMatch?.matchedRule || "active-consent"
+            }
+          });
+          return;
+        }
+
+        const decision = evaluateOutboundCommunication({
+          target,
+          content: String(params.message ?? "")
+        });
+
+        return handleConsentRequired({
+          api,
+          scope: "sessions_send",
+          target,
+          decision,
+          pluginCfg,
+          auditRecord: { kind: "before_tool_call", toolName, event, context: ctx }
+        });
+      }
+    });
+
+    api.registerCommand({
+      name: "passport",
+      description: "Review Agent Passport status and pending consent requests",
+      acceptsArgs: true,
+      handler: async (ctx) => {
+        const pluginCfg = currentConfig();
+        const tokens = (ctx.args?.trim() ?? "").split(/\s+/).filter(Boolean);
+        const action = (tokens[0] ?? "status").toLowerCase();
+
+        if (action === "status") {
+          return buildStatusReply(pluginCfg);
+        }
+
+        if (action === "requests") {
+          const status = (tokens[1] ?? "pending").toLowerCase();
+          if (status === "pending" || status === "approved" || status === "denied" || status === "all") {
+            return buildRequestsReply(status);
+          }
+          return { text: "Usage: /passport requests [pending|approved|denied|all]" };
+        }
+
+        if (action === "scan") {
+          const targetPath = tokens.slice(1).join(" ").trim();
+          if (!targetPath) return { text: "Usage: /passport scan <path>" };
+          try {
+            const report = await scanPath(targetPath);
+            const scanReview = await getLatestScanReview(report.fingerprint);
+            await appendAuditRecord({ kind: "command_scan_path", targetPath, senderId: ctx.senderId, report, scanReview });
+            return { text: buildScanReply(report, scanReview) };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport scan failed: ${message}` };
+          }
+        }
+
+        if (action === "preflight") {
+          const targetPath = tokens.slice(1).join(" ").trim();
+          if (!targetPath) return { text: "Usage: /passport preflight <path>" };
+          try {
+            const { report, scanReview, preflight } = await buildArtifactPreflight(targetPath);
+            await appendAuditRecord({ kind: "command_preflight_artifact", targetPath, senderId: ctx.senderId, report, scanReview, preflight });
+            return {
+              text: [
+                `Agent Passport preflight: ${report.scannedPath}`,
+                `- allowed now: ${preflight.allowed ? "yes" : "no"}`,
+                `- disposition: ${preflight.disposition}`,
+                `- reason: ${preflight.reason}`,
+                `- scanner recommendation: ${report.packageRecommendation.action}`,
+                ...(scanReview ? [`- review state: ${decisionSummary(scanReview.decision)} at ${scanReview.createdAt}`] : ["- review state: none recorded for this fingerprint"]),
+                "",
+                buildScanReply(report, scanReview)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport preflight failed: ${message}` };
+          }
+        }
+
+        if (action === "authorize") {
+          const artifactAction = (tokens[1] ?? "").toLowerCase();
+          const targetPath = tokens.slice(2).join(" ").trim();
+          if ((artifactAction !== "install" && artifactAction !== "enable" && artifactAction !== "update") || !targetPath) {
+            return { text: "Usage: /passport authorize <install|enable|update> <path>" };
+          }
+          try {
+            const result = await buildArtifactAuthorization({ action: artifactAction as "install" | "enable" | "update", targetPath });
+            await appendAuditRecord({ kind: "command_authorize_artifact", targetPath, senderId: ctx.senderId, ...result });
+            return { text: buildAuthorizationReply(result) };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport authorize failed: ${message}` };
+          }
+        }
+
+        if (action === "run") {
+          const rawArgs = ctx.args?.trim() ?? "";
+          const separator = rawArgs.indexOf(" -- ");
+          if (separator === -1) {
+            return { text: "Usage: /passport run <install|enable|update> <path> -- <command>" };
+          }
+          const left = rawArgs.slice(0, separator).trim().split(/\s+/).filter(Boolean);
+          const command = rawArgs.slice(separator + 4).trim();
+          const artifactAction = (left[1] ?? "").toLowerCase();
+          const targetPath = left.slice(2).join(" ").trim();
+          if ((artifactAction !== "install" && artifactAction !== "enable" && artifactAction !== "update") || !targetPath || !command) {
+            return { text: "Usage: /passport run <install|enable|update> <path> -- <command>" };
+          }
+          try {
+            const result = await runArtifactAction({
+              action: artifactAction as "install" | "enable" | "update",
+              targetPath,
+              command
+            });
+            await appendAuditRecord({ kind: "command_run_artifact", senderId: ctx.senderId, targetPath, ...result });
+            return { text: buildRunReply(result) };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport run failed: ${message}` };
+          }
+        }
+
+        if (action === "install-plugin") {
+          const argTokens = tokens.slice(1);
+          const flags = new Set(argTokens.filter((token) => token.startsWith("--")));
+          const targetPath = argTokens.filter((token) => !token.startsWith("--")).join(" ").trim();
+          if (!targetPath) {
+            return { text: "Usage: /passport install-plugin <local-path> [--link] [--pin] [--enable] [--dry-run]" };
+          }
+          try {
+            const result = await installOpenClawPluginFromPath({
+              path: targetPath,
+              link: flags.has("--link"),
+              pin: flags.has("--pin"),
+              enableAfterInstall: flags.has("--enable"),
+              dryRun: flags.has("--dry-run")
+            });
+            await appendAuditRecord({ kind: "command_install_openclaw_plugin", senderId: ctx.senderId, input: { targetPath, flags: [...flags] }, result });
+            return {
+              text: [
+                `Agent Passport plugin install wrapper: ${targetPath}`,
+                "",
+                buildRunReply(result.install),
+                ...(result.enable ? ["", `Enable step for ${result.pluginId}:`, "", buildRunReply(result.enable)] : [])
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport install-plugin failed: ${message}` };
+          }
+        }
+
+        if (action === "enable-plugin") {
+          const argTokens = tokens.slice(1);
+          const flags = new Set(argTokens.filter((token) => token.startsWith("--")));
+          const targetPath = argTokens.filter((token) => !token.startsWith("--")).join(" ").trim();
+          if (!targetPath) {
+            return { text: "Usage: /passport enable-plugin <local-path> [--dry-run]" };
+          }
+          try {
+            const result = await enableOpenClawPluginFromPath({
+              path: targetPath,
+              dryRun: flags.has("--dry-run")
+            });
+            await appendAuditRecord({ kind: "command_enable_openclaw_plugin", senderId: ctx.senderId, input: { targetPath, flags: [...flags] }, result });
+            return {
+              text: [
+                `Agent Passport plugin enable wrapper: ${result.pluginId}`,
+                `- manifest: ${result.manifestPath}`,
+                "",
+                buildRunReply(result.enable)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport enable-plugin failed: ${message}` };
+          }
+        }
+
+        if (action === "update-plugin") {
+          const pluginId = tokens[1]?.trim();
+          const dryRun = tokens.includes("--dry-run");
+          if (!pluginId || pluginId.startsWith("--")) {
+            return { text: "Usage: /passport update-plugin <pluginId> [--dry-run]" };
+          }
+          try {
+            const result = await updateOpenClawPluginFromLedger({ pluginId, dryRun });
+            await appendAuditRecord({ kind: "command_update_openclaw_plugin", senderId: ctx.senderId, input: { pluginId, dryRun }, result });
+            return {
+              text: [
+                `Agent Passport plugin update wrapper: ${result.pluginId}`,
+                `- source: ${result.sourcePath}`,
+                "",
+                buildRunReply(result.update)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport update-plugin failed: ${message}` };
+          }
+        }
+
+        if (action === "update-skill") {
+          const slug = tokens[1]?.trim();
+          const dryRun = tokens.includes("--dry-run");
+          if (!slug || slug.startsWith("--")) {
+            return { text: "Usage: /passport update-skill <slug> [--dry-run]" };
+          }
+          try {
+            const result = await updateOpenClawSkill({ slug, dryRun });
+            await appendAuditRecord({ kind: "command_update_openclaw_skill", senderId: ctx.senderId, input: { slug, dryRun }, result });
+            return {
+              text: [
+                `Agent Passport skill update wrapper: ${slug}`,
+                `- skill dir: ${result.skillDir}`,
+                `- command: ${result.updateCommand}`,
+                `- executed: ${result.executed ? "yes" : "no"}`,
+                ...(result.execution ? [
+                  `- success: ${result.execution.ok ? "yes" : "no"}`,
+                  `- exit code: ${result.execution.exitCode ?? "null"}`
+                ] : []),
+                ...(result.afterState ? ["", buildSkillStateReply(result.afterState)] : [])
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport update-skill failed: ${message}` };
+          }
+        }
+
+        if (action === "update-skills") {
+          const dryRun = tokens.includes("--dry-run");
+          try {
+            const result = await updateAllOpenClawSkills({ dryRun });
+            await appendAuditRecord({ kind: "command_update_all_openclaw_skills", senderId: ctx.senderId, input: { dryRun }, result });
+            const states = result.afterStates ?? result.beforeStates;
+            return {
+              text: [
+                "Agent Passport skills update wrapper:",
+                `- command: ${result.updateCommand}`,
+                `- executed: ${result.executed ? "yes" : "no"}`,
+                ...(result.execution ? [
+                  `- success: ${result.execution.ok ? "yes" : "no"}`,
+                  `- exit code: ${result.execution.exitCode ?? "null"}`
+                ] : []),
+                `- tracked skills: ${result.summary.trackedCount}`,
+                `- changed skills: ${result.summary.changedCount}`,
+                `- trusted: ${result.summary.trustedCount}`,
+                `- reviewed: ${result.summary.reviewedCount}`,
+                `- blocked: ${result.summary.blockedCount}`,
+                `- re-review required: ${result.summary.rereviewRequiredCount}`,
+                `- missing: ${result.summary.missingCount}`,
+                "",
+                "Skill states:",
+                ...states.map(([slug, state]) => `- ${slug}: ${state.state}${state.installedVersion ? ` (${state.installedVersion})` : ""}`)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport update-skills failed: ${message}` };
+          }
+        }
+
+        if (action === "installs") {
+          const pluginId = tokens[1]?.trim();
+          const installs = await listPluginInstalls({ pluginId: pluginId || undefined });
+          if (!installs.length) {
+            return { text: `Agent Passport installs${pluginId ? ` for ${pluginId}` : ""}: none recorded.` };
+          }
+          return {
+            text: [
+              `Agent Passport installs${pluginId ? ` for ${pluginId}` : ""}:`,
+              ...installs.slice(0, 10).map((record) => [
+                `- ${record.pluginId} (${record.pluginName})`,
+                `  source: ${record.sourcePath}`,
+                `  fingerprint: ${record.fingerprint}`,
+                `  installedAt: ${record.installedAt}`,
+                `  enabledAt: ${record.enabledAt ?? "not recorded"}`,
+                `  review: ${record.reviewDecision ?? "none"}`,
+                `  recommendation: ${record.recommendationAction}`
+              ].join("\n"))
+            ].join("\n\n")
+          };
+        }
+
+        if (action === "skills") {
+          const result = await listSkillStates();
+          if (!result.length) {
+            return { text: "Agent Passport skills: no tracked ClawHub skills found in this workspace." };
+          }
+          return {
+            text: [
+              "Agent Passport skills:",
+              ...result.map((item) => [
+                `- ${item.slug}`,
+                `  state: ${item.state}`,
+                `  version: ${item.installedVersion ?? "unknown"}`,
+                `  verdict/recommendation: ${item.verdict ?? "unknown"} / ${item.recommendation ?? "unknown"}`,
+                `  review: ${item.currentReview ? decisionSummary(item.currentReview.decision) : "none"}`
+              ].join("\n"))
+            ].join("\n\n")
+          };
+        }
+
+        if (action === "workspace-state") {
+          const result = await buildWorkspaceState();
+          const reply = buildWorkspaceStateReply(result);
+          await appendAuditRecord({ kind: "command_workspace_state", senderId: ctx.senderId, result });
+          return reply;
+        }
+
+        if (action === "skill-state") {
+          const slug = tokens[1]?.trim();
+          if (!slug) {
+            return { text: "Usage: /passport skill-state <slug>" };
+          }
+          const result = await buildSkillState({ slug });
+          await appendAuditRecord({ kind: "command_skill_state", senderId: ctx.senderId, input: { slug }, result });
+          return { text: buildSkillStateReply(result) };
+        }
+
+        if (action === "drift-skill") {
+          const slug = tokens[1]?.trim();
+          if (!slug) {
+            return { text: "Usage: /passport drift-skill <slug>" };
+          }
+          const result = await checkSkillDrift({ slug });
+          await appendAuditRecord({ kind: "command_check_skill_drift", senderId: ctx.senderId, input: { slug }, result });
+          if (!result.ok) {
+            return { text: `Agent Passport skill drift check failed for ${slug}: ${result.reason}` };
+          }
+          return {
+            text: [
+              `Agent Passport skill drift check: ${slug}`,
+              `- changed: ${result.drift?.changed ? "yes" : "no"}`,
+              `- reason: ${result.reason}`,
+              `- installed version: ${result.installedVersion ?? "unknown"}`,
+              `- recorded fingerprint: ${result.drift?.recordedFingerprint}`,
+              `- current fingerprint: ${result.drift?.currentFingerprint}`,
+              `- recorded verdict/recommendation: ${result.drift?.recordedVerdict} / ${result.drift?.recordedRecommendation}`,
+              `- current verdict/recommendation: ${result.drift?.currentVerdict} / ${result.drift?.currentRecommendation}`,
+              `- current review state: ${result.currentReview ? decisionSummary(result.currentReview.decision) : "none recorded for current fingerprint"}`,
+              "",
+              buildScanReply(result.currentReport!, result.currentReview)
+            ].join("\n")
+          };
+        }
+
+        if (action === "skills-rereview") {
+          const queue = await listSkillsNeedingRereview();
+          if (!queue.length) {
+            return { text: "Agent Passport skill re-review queue: empty." };
+          }
+          return {
+            text: [
+              "Agent Passport skill re-review queue:",
+              ...queue.map((item) => [
+                `- ${item.slug}`,
+                `  skill dir: ${item.skillDir}`,
+                `  version: ${item.installedVersion ?? "unknown"}`,
+                `  recorded fingerprint: ${item.recordedFingerprint}`,
+                `  current fingerprint: ${item.currentFingerprint}`,
+                `  recorded recommendation: ${item.recordedRecommendation}`,
+                `  current recommendation: ${item.currentRecommendation}`,
+                `  current review: ${item.currentReviewDecision ?? "none"}`,
+                `  reason: ${item.reason}`
+              ].join("\n"))
+            ].join("\n\n")
+          };
+        }
+
+        if (action === "plugin-state") {
+          const pluginId = tokens[1]?.trim();
+          if (!pluginId) {
+            return { text: "Usage: /passport plugin-state <pluginId>" };
+          }
+          const result = await buildPluginState({ pluginId });
+          await appendAuditRecord({ kind: "command_plugin_state", senderId: ctx.senderId, input: { pluginId }, result });
+          return { text: buildPluginStateReply(result) };
+        }
+
+        if (action === "drift-plugin") {
+          const pluginId = tokens[1]?.trim();
+          if (!pluginId) {
+            return { text: "Usage: /passport drift-plugin <pluginId>" };
+          }
+          try {
+            const result = await checkPluginInstallDrift({ pluginId });
+            await appendAuditRecord({ kind: "command_check_plugin_drift", senderId: ctx.senderId, input: { pluginId }, result });
+            if (!result.ok) {
+              return { text: `Agent Passport drift check failed for ${pluginId}: ${result.reason}` };
+            }
+            return {
+              text: [
+                `Agent Passport drift check: ${pluginId}`,
+                `- changed: ${result.drift?.changed ? "yes" : "no"}`,
+                `- reason: ${result.reason}`,
+                `- recorded fingerprint: ${result.drift?.recordedFingerprint}`,
+                `- current fingerprint: ${result.drift?.currentFingerprint}`,
+                `- recorded verdict/recommendation: ${result.drift?.recordedVerdict} / ${result.drift?.recordedRecommendation}`,
+                `- current verdict/recommendation: ${result.drift?.currentVerdict} / ${result.drift?.currentRecommendation}`,
+                `- current review state: ${result.currentReview ? decisionSummary(result.currentReview.decision) : "none recorded for current fingerprint"}`,
+                "",
+                buildScanReply(result.currentReport!, result.currentReview)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport drift-plugin failed: ${message}` };
+          }
+        }
+
+        if (action === "rereview-queue") {
+          const queue = await listPluginsNeedingRereview();
+          if (!queue.length) {
+            return { text: "Agent Passport re-review queue: empty." };
+          }
+          return {
+            text: [
+              "Agent Passport re-review queue:",
+              ...queue.map((item) => [
+                `- ${item.pluginId} (${item.pluginName})`,
+                `  source: ${item.sourcePath}`,
+                `  recorded fingerprint: ${item.recordedFingerprint}`,
+                `  current fingerprint: ${item.currentFingerprint}`,
+                `  recorded recommendation: ${item.recordedRecommendation}`,
+                `  current recommendation: ${item.currentRecommendation}`,
+                `  current review: ${item.currentReviewDecision ?? "none"}`,
+                `  reason: ${item.reason}`
+              ].join("\n"))
+            ].join("\n\n")
+          };
+        }
+
+        if (action === "drift-sweep") {
+          const result = await sweepRereviewQueue();
+          await appendAuditRecord({ kind: "command_drift_sweep", senderId: ctx.senderId, result });
+          if (!result.summary.queueCount) {
+            return { text: "Agent Passport drift sweep: queue empty. Nothing new, nothing unresolved. Review: /passport workspace-state" };
+          }
+          return {
+            text: [
+              "Agent Passport drift sweep:",
+              `- queue count: ${result.summary.queueCount}`,
+              `- newly entered: ${result.summary.newCount}`,
+              `- resolved since last sweep: ${result.summary.resolvedCount}`,
+              `- review with: /passport workspace-state`,
+              ...(result.newlyEntered.length ? ["", "Newly entered:", ...result.newlyEntered.map((item) => `- ${item.pluginId}: ${item.reason}`)] : []),
+              ...(result.resolved.length ? ["", "Resolved since last sweep:", ...result.resolved.map((item) => `- ${item.pluginId} @ ${item.fingerprint}`)] : []),
+              ...(result.queue.length ? ["", "Current queue:", ...result.queue.map((item) => `- ${item.pluginId}: ${item.reason}`)] : [])
+            ].join("\n")
+          };
+        }
+
+        if (action === "drift-alerts") {
+          const result = await buildDriftAlerts();
+          await appendAuditRecord({ kind: "command_drift_alerts", senderId: ctx.senderId, result });
+          if (!result.alert) {
+            return { text: `Agent Passport drift alerts: no new re-review entries. Queue=${result.summary.queueCount}, resolved=${result.summary.resolvedCount}. Review: ${result.nextCommand}.` };
+          }
+          return {
+            text: [
+              "Agent Passport drift alerts:",
+              `- alert: yes`,
+              `- new entries: ${result.summary.newCount}`,
+              `- queue count: ${result.summary.queueCount}`,
+              `- resolved since last sweep: ${result.summary.resolvedCount}`,
+              `- review with: ${result.nextCommand}`,
+              "",
+              "Newly entered:",
+              ...result.newlyEntered.map((item) => `- ${item.pluginId}: ${item.reason}`)
+            ].join("\n")
+          };
+        }
+
+        if (action === "trust-skill" || action === "review-skill" || action === "block-skill") {
+          const slug = tokens[1]?.trim();
+          if (!slug) return { text: `Usage: /passport ${action} <slug>` };
+          const decision = action.replace("-skill", "") as PassportScanDecision;
+          try {
+            const { report, review } = await applySkillDecision({
+              slug,
+              decision,
+              senderId: ctx.senderId,
+              note: `Recorded via /passport ${action}`
+            });
+            return {
+              text: [
+                `Recorded ${decisionSummary(review.decision)} for skill ${slug}.`,
+                `- path: ${report.scannedPath}`,
+                "",
+                buildScanReply(report, review)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport ${action} failed: ${message}` };
+          }
+        }
+
+        if (action === "trust-plugin" || action === "review-plugin" || action === "block-plugin") {
+          const pluginId = tokens[1]?.trim();
+          if (!pluginId) return { text: `Usage: /passport ${action} <pluginId>` };
+          const decision = action.replace("-plugin", "") as PassportScanDecision;
+          try {
+            const { report, review } = await applyPluginDecision({
+              pluginId,
+              decision,
+              senderId: ctx.senderId,
+              note: `Recorded via /passport ${action}`
+            });
+            return {
+              text: [
+                `Recorded ${decisionSummary(review.decision)} for plugin ${pluginId}.`,
+                `- path: ${report.scannedPath}`,
+                "",
+                buildScanReply(report, review)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport ${action} failed: ${message}` };
+          }
+        }
+
+        if (action === "trust" || action === "review" || action === "block") {
+          const targetPath = tokens.slice(1).join(" ").trim();
+          if (!targetPath) return { text: `Usage: /passport ${action} <path>` };
+          try {
+            const { report, review } = await applyScanDecision({
+              targetPath,
+              decision: action,
+              senderId: ctx.senderId,
+              note: `Recorded via /passport ${action}`
+            });
+            return {
+              text: [
+                `Recorded ${decisionSummary(review.decision)} for ${report.scannedPath}.`,
+                "",
+                buildScanReply(report, review)
+              ].join("\n")
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport ${action} failed: ${message}` };
+          }
+        }
+
+        if (action === "approve" || action === "deny") {
+          const requestId = tokens[1]?.trim();
+          if (!requestId) return { text: `Usage: /passport ${action} <requestId>` };
+          const result = await reviewConsentRequest({
+            requestId,
+            decision: action === "approve" ? "approved" : "denied",
+            ttlMinutes: pluginCfg.consentTtlMinutes,
+            note: `Reviewed via /passport ${action}`
+          });
+          await appendAuditRecord({ kind: "command_review_request", action, requestId, senderId: ctx.senderId, result });
+          if (!result.ok) return { text: result.error };
+          const updated = await buildRequestsReply("pending");
+          return {
+            text: `${action === "approve" ? "Approved" : "Denied"} ${requestId}.\n\n${updated.text}`,
+            interactive: updated.interactive
+          };
+        }
+
+        return {
+          text: "Usage:\n/passport status\n/passport requests [pending|approved|denied|all]\n/passport scan <path>\n/passport preflight <path>\n/passport authorize <install|enable|update> <path>\n/passport run <install|enable|update> <path> -- <command>\n/passport install-plugin <local-path> [--link] [--pin] [--enable] [--dry-run]\n/passport enable-plugin <local-path> [--dry-run]\n/passport update-plugin <pluginId> [--dry-run]\n/passport update-skill <slug> [--dry-run]\n/passport update-skills [--dry-run]\n/passport installs [pluginId]\n/passport skills\n/passport workspace-state\n/passport skill-state <slug>\n/passport drift-skill <slug>\n/passport skills-rereview\n/passport trust-skill <slug>\n/passport review-skill <slug>\n/passport block-skill <slug>\n/passport plugin-state <pluginId>\n/passport trust-plugin <pluginId>\n/passport review-plugin <pluginId>\n/passport block-plugin <pluginId>\n/passport drift-plugin <pluginId>\n/passport rereview-queue\n/passport drift-sweep\n/passport drift-alerts\n/passport trust <path>\n/passport review <path>\n/passport block <path>\n/passport approve <requestId>\n/passport deny <requestId>"
+        };
+      }
+    });
+
+    api.registerInteractiveHandler({
+      channel: "telegram",
+      namespace: TELEGRAM_NAMESPACE,
+      handler: async (ctx) => {
+        const pluginCfg = currentConfig();
+        if (!ctx.auth.isAuthorizedSender) {
+          await ctx.respond.reply({ text: "Not authorized." });
+          return { handled: true };
+        }
+
+        const { action, requestId, target } = parseInteractivePayload(ctx.callback.payload);
+
+        if (action === "workspace") {
+          const result = await buildWorkspaceState();
+          const reply = buildWorkspaceStateReply(result);
+          await ctx.respond.editMessage({
+            text: reply.text ?? "Agent Passport workspace state unavailable.",
+            buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
+              ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+              : [])
+          });
+          return { handled: true };
+        }
+
+        if (action === "plugin-state" && target) {
+          const result = await buildPluginState({ pluginId: target });
+          await ctx.respond.editMessage({
+            text: buildPluginStateReply(result),
+            buttons: [[{ text: "Back to workspace", callback_data: "workspace" }]]
+          });
+          return { handled: true };
+        }
+
+        if (action === "skill-state" && target) {
+          const result = await buildSkillState({ slug: target });
+          await ctx.respond.editMessage({
+            text: buildSkillStateReply(result),
+            buttons: [[{ text: "Back to workspace", callback_data: "workspace" }]]
+          });
+          return { handled: true };
+        }
+
+        if (action === "requests") {
+          const reply = await buildRequestsReply("pending");
+          await ctx.respond.editMessage({
+            text: reply.text ?? "Agent Passport requests: none.",
+            buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
+              ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+              : [])
+          });
+          return { handled: true };
+        }
+
+        if ((action === "approve" || action === "deny") && requestId) {
+          const result = await reviewConsentRequest({
+            requestId,
+            decision: action === "approve" ? "approved" : "denied",
+            ttlMinutes: pluginCfg.consentTtlMinutes,
+            note: `Reviewed via Telegram button by ${ctx.senderId ?? "unknown"}`
+          });
+          await appendAuditRecord({ kind: "interactive_review_request", action, requestId, senderId: ctx.senderId, result });
+          if (!result.ok) {
+            await ctx.respond.reply({ text: result.error });
+            return { handled: true };
+          }
+          const updated = await buildRequestsReply("pending");
+          await ctx.respond.editMessage({
+            text: `${action === "approve" ? "Approved" : "Denied"} ${requestId}.\n\n${updated.text}`,
+            buttons: updated.interactive?.blocks.flatMap((block) => block.type === "buttons"
+              ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+              : [])
+          });
+          return { handled: true };
+        }
+
+        if (action === "status") {
+          const reply = await buildStatusReply(pluginCfg);
+          await ctx.respond.editMessage({
+            text: reply.text ?? "Agent Passport status unavailable.",
+            buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
+              ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+              : [])
+          });
+          return { handled: true };
+        }
+
+        if ((action === "review-plugin" || action === "trust-plugin" || action === "block-plugin") && target) {
+          const decision = action.replace("-plugin", "") as PassportScanDecision;
+          try {
+            await applyPluginDecision({
+              pluginId: target,
+              decision,
+              senderId: ctx.senderId,
+              note: `Reviewed via Telegram button by ${ctx.senderId ?? "unknown"}`
+            });
+            const result = await buildWorkspaceState();
+            const reply = buildWorkspaceStateReply(result);
+            await ctx.respond.editMessage({
+              text: reply.text ?? "Agent Passport workspace state unavailable.",
+              buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
+                ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+                : [])
+            });
+            return { handled: true };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            await ctx.respond.reply({ text: `Agent Passport ${action} failed: ${message}` });
+            return { handled: true };
+          }
+        }
+
+        if ((action === "review-skill" || action === "trust-skill" || action === "block-skill") && target) {
+          const decision = action.replace("-skill", "") as PassportScanDecision;
+          try {
+            await applySkillDecision({
+              slug: target,
+              decision,
+              senderId: ctx.senderId,
+              note: `Reviewed via Telegram button by ${ctx.senderId ?? "unknown"}`
+            });
+            const result = await buildWorkspaceState();
+            const reply = buildWorkspaceStateReply(result);
+            await ctx.respond.editMessage({
+              text: reply.text ?? "Agent Passport workspace state unavailable.",
+              buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
+                ? [block.buttons.map((button) => ({ text: button.label, callback_data: button.value }))]
+                : [])
+            });
+            return { handled: true };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            await ctx.respond.reply({ text: `Agent Passport ${action} failed: ${message}` });
+            return { handled: true };
+          }
+        }
+
+        await ctx.respond.reply({ text: "Unknown Agent Passport action." });
+        return { handled: true };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_status",
+      description: "Show Agent Passport mode and current policy defaults",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const pluginCfg = currentConfig();
+        const grants = await listConsents();
+        const pendingRequests = await listConsentRequests({ status: "pending" });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                loaded: true,
+                mode: pluginCfg.mode,
+                pathModes: pluginCfg.pathModes,
+                trustedTargets: pluginCfg.trustedTargets,
+                trustedTargetRules: pluginCfg.trustedTargetRules,
+                consentTtlMinutes: pluginCfg.consentTtlMinutes,
+                activeConsentCount: grants.length,
+                pendingConsentRequestCount: pendingRequests.length,
+                guardedPaths: ["message_sending", "message(action=send)", "sessions_send"],
+                reviewedArtifactCount: (await listScanReviews()).length,
+                recordedPluginInstallCount: (await listPluginInstalls()).length,
+                trackedSkillCount: (await listSkillStates()).length,
+                pluginRereviewQueueCount: (await listPluginsNeedingRereview()).length,
+                skillRereviewQueueCount: (await listSkillsNeedingRereview()).length,
+                rereviewQueueCount: (await listPluginsNeedingRereview()).length + (await listSkillsNeedingRereview()).length
+              }, null, 2)
+            }
+          ]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_scan_path",
+      description: "Scan a local skill, plugin, or package path for ClawHavoc-style poisoned-package indicators",
+      parameters: Type.Object({
+        path: Type.String(),
+        maxFiles: Type.Optional(Type.Number({ minimum: 1 }))
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const report = await scanPath(params.path, { maxFiles: params.maxFiles ? Math.floor(params.maxFiles) : undefined });
+        const scanReview = await getLatestScanReview(report.fingerprint);
+        await appendAuditRecord({ kind: "tool_scan_path", input: params, report, scanReview });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ...report, currentReview: scanReview }, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_review_scan",
+      description: "Record a trust, review, or block decision for a scanned artifact path",
+      parameters: Type.Object({
+        path: Type.String(),
+        decision: Type.Union([
+          Type.Literal("trust"),
+          Type.Literal("review"),
+          Type.Literal("block")
+        ]),
+        note: Type.Optional(Type.String())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await applyScanDecision({
+          targetPath: params.path,
+          decision: params.decision,
+          note: params.note
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_review_skill",
+      description: "Record a trust, review, or block decision for a tracked workspace skill by slug",
+      parameters: Type.Object({
+        slug: Type.String(),
+        decision: Type.Union([
+          Type.Literal("trust"),
+          Type.Literal("review"),
+          Type.Literal("block")
+        ]),
+        note: Type.Optional(Type.String())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await applySkillDecision({
+          slug: params.slug,
+          decision: params.decision,
+          note: params.note
+        });
+        await appendAuditRecord({ kind: "tool_review_skill", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_review_plugin",
+      description: "Record a trust, review, or block decision for a Passport-recorded plugin by plugin id",
+      parameters: Type.Object({
+        pluginId: Type.String(),
+        decision: Type.Union([
+          Type.Literal("trust"),
+          Type.Literal("review"),
+          Type.Literal("block")
+        ]),
+        note: Type.Optional(Type.String())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await applyPluginDecision({
+          pluginId: params.pluginId,
+          decision: params.decision,
+          note: params.note
+        });
+        await appendAuditRecord({ kind: "tool_review_plugin", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_preflight_artifact",
+      description: "Evaluate whether a scanned artifact should be allowed to install or enable right now, based on scanner posture and recorded review state",
+      parameters: Type.Object({
+        path: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await buildArtifactPreflight(params.path);
+        await appendAuditRecord({ kind: "tool_preflight_artifact", input: params, ...result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_authorize_artifact_action",
+      description: "Authorize a specific artifact action such as install or enable using scanner posture plus recorded review state",
+      parameters: Type.Object({
+        action: Type.Union([
+          Type.Literal("install"),
+          Type.Literal("enable"),
+          Type.Literal("update")
+        ]),
+        path: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await buildArtifactAuthorization({ action: params.action, targetPath: params.path });
+        await appendAuditRecord({ kind: "tool_authorize_artifact", input: params, ...result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_run_artifact_action",
+      description: "Run an install or enable command only if Passport authorizes that artifact action first",
+      parameters: Type.Object({
+        action: Type.Union([
+          Type.Literal("install"),
+          Type.Literal("enable"),
+          Type.Literal("update")
+        ]),
+        path: Type.String(),
+        command: Type.String(),
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await runArtifactAction({
+          action: params.action,
+          targetPath: params.path,
+          command: params.command,
+          dryRun: params.dryRun
+        });
+        await appendAuditRecord({ kind: "tool_run_artifact", input: params, ...result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_install_openclaw_plugin",
+      description: "Install a local OpenClaw plugin path only if Passport authorizes it first, with optional linked install and optional enable-after-install",
+      parameters: Type.Object({
+        path: Type.String(),
+        link: Type.Optional(Type.Boolean()),
+        pin: Type.Optional(Type.Boolean()),
+        enableAfterInstall: Type.Optional(Type.Boolean()),
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await installOpenClawPluginFromPath(params);
+        await appendAuditRecord({ kind: "tool_install_openclaw_plugin", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_enable_openclaw_plugin",
+      description: "Enable a local OpenClaw plugin path only if Passport authorizes it first",
+      parameters: Type.Object({
+        path: Type.String(),
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await enableOpenClawPluginFromPath(params);
+        await appendAuditRecord({ kind: "tool_enable_openclaw_plugin", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_update_openclaw_plugin",
+      description: "Update a Passport-recorded OpenClaw plugin only if Passport authorizes the update against the current recorded local source",
+      parameters: Type.Object({
+        pluginId: Type.String(),
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await updateOpenClawPluginFromLedger(params);
+        await appendAuditRecord({ kind: "tool_update_openclaw_plugin", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_plugin_installs",
+      description: "List Passport-recorded plugin installs for local OpenClaw plugin paths",
+      parameters: Type.Object({
+        pluginId: Type.Optional(Type.String())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await listPluginInstalls({ pluginId: params.pluginId });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_plugin_state",
+      description: "Return the combined install, drift, and review state for a Passport-recorded plugin",
+      parameters: Type.Object({
+        pluginId: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await buildPluginState({ pluginId: params.pluginId });
+        await appendAuditRecord({ kind: "tool_plugin_state", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_workspace_state",
+      description: "Return a combined workspace view across tracked plugins and skills, including attention queues",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await buildWorkspaceState();
+        await appendAuditRecord({ kind: "tool_workspace_state", result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_check_plugin_drift",
+      description: "Re-scan the last Passport-recorded local source for a plugin and compare it against the fingerprint captured at install time",
+      parameters: Type.Object({
+        pluginId: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await checkPluginInstallDrift({ pluginId: params.pluginId });
+        await appendAuditRecord({ kind: "tool_check_plugin_drift", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_skill_state",
+      description: "Return the current install and review state for one tracked workspace skill",
+      parameters: Type.Object({
+        slug: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await buildSkillState({ slug: params.slug });
+        await appendAuditRecord({ kind: "tool_skill_state", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_skills_state",
+      description: "List tracked workspace skills with Passport state summaries",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await listSkillStates();
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_check_skill_drift",
+      description: "Compare the current installed skill fingerprint against the last Passport-reviewed fingerprint for that skill slug",
+      parameters: Type.Object({
+        slug: Type.String()
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await checkSkillDrift({ slug: params.slug });
+        await appendAuditRecord({ kind: "tool_check_skill_drift", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_update_openclaw_skill",
+      description: "Run openclaw skills update for one tracked workspace skill, then return the resulting Passport state",
+      parameters: Type.Object({
+        slug: Type.String(),
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await updateOpenClawSkill({ slug: params.slug, dryRun: params.dryRun });
+        await appendAuditRecord({ kind: "tool_update_openclaw_skill", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_update_all_openclaw_skills",
+      description: "Run openclaw skills update --all for tracked workspace skills, then return a Passport summary of resulting states",
+      parameters: Type.Object({
+        dryRun: Type.Optional(Type.Boolean())
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await updateAllOpenClawSkills({ dryRun: params.dryRun });
+        await appendAuditRecord({ kind: "tool_update_all_openclaw_skills", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_skills_rereview_queue",
+      description: "List tracked skills whose installed fingerprint drifted since the last Passport skill review and whose new fingerprint is not explicitly trusted",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await listSkillsNeedingRereview();
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_rereview_queue",
+      description: "List Passport-recorded plugins whose source drifted and whose new fingerprint is not yet explicitly trusted",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await listPluginsNeedingRereview();
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_drift_sweep",
+      description: "Sweep the re-review queue and report what newly entered or resolved since the last sweep",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await sweepRereviewQueue();
+        await appendAuditRecord({ kind: "tool_drift_sweep", result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_drift_alerts",
+      description: "Run a remembered-state drift sweep and return only whether new re-review alerts appeared, plus newly entered and resolved items",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const result = await buildDriftAlerts();
+        await appendAuditRecord({ kind: "tool_drift_alerts", result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_scan_reviews",
+      description: "List recorded scan-review decisions, optionally filtered by artifact fingerprint or decision",
+      parameters: Type.Object({
+        fingerprint: Type.Optional(Type.String()),
+        decision: Type.Optional(Type.Union([
+          Type.Literal("trust"),
+          Type.Literal("review"),
+          Type.Literal("block")
+        ]))
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const reviews = await listScanReviews({
+          fingerprint: params.fingerprint,
+          decision: params.decision
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(reviews, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_explain",
+      description: "Explain how Agent Passport would classify a proposed action",
+      parameters: Type.Object({
+        action: Type.String(),
+        target: Type.Optional(Type.String())
+      }),
+      async execute(_id, params) {
+        const decision = evaluateAction({
+          action: params.action,
+          target: params.target ?? null
+        });
+
+        await appendAuditRecord({
+          kind: "explain",
+          input: params,
+          decision
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(decision, null, 2)
+            }
+          ]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_grant_consent",
+      description: "Grant temporary outbound-consent for a target",
+      parameters: Type.Object({
+        target: Type.String(),
+        ttlMinutes: Type.Optional(Type.Number({ minimum: 1 })),
+        reason: Type.Optional(Type.String())
+      }),
+      async execute(_id, params) {
+        const pluginCfg = currentConfig();
+        const grant = await grantConsent({
+          target: params.target,
+          ttlMinutes: params.ttlMinutes ?? pluginCfg.consentTtlMinutes,
+          reason: params.reason
+        });
+
+        await appendAuditRecord({ kind: "grant_consent", grant });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(grant, null, 2)
+          }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_consents",
+      description: "List active temporary consent grants",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute() {
+        const grants = await listConsents();
+        return {
+          content: [{ type: "text", text: JSON.stringify(grants, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_revoke_consent",
+      description: "Revoke temporary outbound-consent for a target",
+      parameters: Type.Object({
+        target: Type.String()
+      }),
+      async execute(_id, params) {
+        const result = await revokeConsent(params.target);
+        await appendAuditRecord({ kind: "revoke_consent", target: params.target, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_request_consent",
+      description: "Create or fetch a pending consent request for an outbound action",
+      parameters: Type.Object({
+        target: Type.String(),
+        action: Type.Union([
+          Type.Literal("message_sending"),
+          Type.Literal("message.send"),
+          Type.Literal("sessions_send")
+        ]),
+        reason: Type.Optional(Type.String())
+      }),
+      async execute(_id, params) {
+        const request = await createConsentRequest(params);
+        await appendAuditRecord({ kind: "request_consent", request });
+        return {
+          content: [{ type: "text", text: JSON.stringify(request, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_list_requests",
+      description: "List pending or historical consent requests",
+      parameters: Type.Object({
+        status: Type.Optional(Type.Union([
+          Type.Literal("pending"),
+          Type.Literal("approved"),
+          Type.Literal("denied"),
+          Type.Literal("all")
+        ]))
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const requests = await listConsentRequests({ status: params.status ?? "pending" });
+        return {
+          content: [{ type: "text", text: JSON.stringify(requests, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_review_request",
+      description: "Approve or deny a pending consent request",
+      parameters: Type.Object({
+        requestId: Type.String(),
+        decision: Type.Union([Type.Literal("approved"), Type.Literal("denied")]),
+        ttlMinutes: Type.Optional(Type.Number({ minimum: 1 })),
+        note: Type.Optional(Type.String())
+      }),
+      async execute(_id, params) {
+        const pluginCfg = currentConfig();
+        const result = await reviewConsentRequest({
+          requestId: params.requestId,
+          decision: params.decision,
+          ttlMinutes: params.ttlMinutes ?? pluginCfg.consentTtlMinutes,
+          note: params.note
+        });
+        await appendAuditRecord({ kind: "review_request", input: params, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+  }
+});

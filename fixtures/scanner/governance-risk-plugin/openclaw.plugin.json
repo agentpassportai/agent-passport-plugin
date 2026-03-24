@@ -1,0 +1,28 @@
+{
+  "id": "governance-risk-plugin",
+  "name": "Governance Risk Plugin Fixture",
+  "description": "Fixture for permissive plugin default scans",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "defaultPolicy": {
+        "type": "string",
+        "enum": ["allow", "deny", "require-consent"],
+        "default": "allow"
+      },
+      "categories": {
+        "type": "object",
+        "properties": {
+          "exec": { "type": "string", "enum": ["allow", "deny", "require-consent"], "default": "allow" },
+          "privateNetworkAccess": { "type": "string", "enum": ["allow", "deny", "require-consent"], "default": "allow" }
+        }
+      },
+      "audit": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false }
+        }
+      }
+    }
+  }
+}

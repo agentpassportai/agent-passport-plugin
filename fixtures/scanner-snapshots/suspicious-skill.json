@@ -1,0 +1,145 @@
+{
+  "scannedPath": "<fixture:suspicious-skill>",
+  "fingerprint": "sha256:95475305067514f4bc43371f76b732a91ea5b462301959ce0dcdb0d7ebb80d9f",
+  "targetType": "directory",
+  "targetKind": "skill",
+  "fileCount": 2,
+  "filesScanned": [
+    "README.md",
+    "SKILL.md"
+  ],
+  "verdict": "suspicious",
+  "score": 5,
+  "summary": "Suspicious skill patterns found: bootstrap-installer, prompt-directed-shell-execution. Current evidence is mainly documentation signals. Review before trust or enablement.",
+  "packageRecommendation": {
+    "action": "review-before-trust",
+    "reason": "This skill has findings that need human review before trust (operator prompted to run shell commands)."
+  },
+  "kindSensitiveNotes": [
+    "Skills have a larger operator-trust surface. Install steps, bootstrap commands, and copy-paste shell instructions matter more here than they would in a pure library.",
+    "This skill includes instruction or install-chain signals. Treat README or SKILL.md shell steps as part of the risk surface, not just documentation.",
+    "The strongest current signal is review-before-trust, not immediate blocking."
+  ],
+  "findings": [
+    {
+      "id": "bootstrap-installer:SKILL.md",
+      "category": "bootstrap-installer",
+      "severity": "medium",
+      "signalType": "documentation",
+      "title": "Bootstrap or installer script behavior referenced",
+      "summary": "This package includes install/bootstrap behavior that deserves review before enablement.",
+      "recommendation": "Require manual review of every install/bootstrap step and verify it is necessary, local, and pinned.",
+      "evidence": [
+        {
+          "filePath": "SKILL.md",
+          "line": 12,
+          "snippet": "bash ./bootstrap.sh"
+        }
+      ]
+    },
+    {
+      "id": "prompt-directed-shell-execution:SKILL.md",
+      "category": "prompt-directed-shell-execution",
+      "severity": "medium",
+      "signalType": "documentation",
+      "title": "Prompt-instruction to run shell commands found",
+      "summary": "The package documentation or scripts explicitly instruct the operator to run commands in a way that could bypass normal review.",
+      "recommendation": "Review every operator-run command manually and avoid copy-paste execution of unpinned shell snippets.",
+      "evidence": [
+        {
+          "filePath": "SKILL.md",
+          "line": 9,
+          "snippet": "Copy and paste this command exactly:"
+        }
+      ]
+    }
+  ],
+  "groupedFindings": [
+    {
+      "id": "SKILL.md:bootstrap-installer",
+      "title": "Suspicious package pattern group",
+      "summary": "SKILL.md contains related findings: bootstrap-installer.",
+      "categories": [
+        "bootstrap-installer"
+      ],
+      "signalTypes": [
+        "documentation"
+      ],
+      "severity": "medium",
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "representativeFindingId": "bootstrap-installer:SKILL.md",
+      "findingIds": [
+        "bootstrap-installer:SKILL.md"
+      ],
+      "filePaths": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "id": "SKILL.md:prompt-directed-shell-execution",
+      "title": "Operator prompted to run shell commands",
+      "summary": "SKILL.md instructs the operator to run shell commands manually.",
+      "categories": [
+        "prompt-directed-shell-execution"
+      ],
+      "signalTypes": [
+        "documentation"
+      ],
+      "severity": "medium",
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The package relies on operator instructions rather than automatic execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This skill relies on operator action, but the instructions are risky enough that it should be reviewed before trust.",
+      "representativeFindingId": "prompt-directed-shell-execution:SKILL.md",
+      "findingIds": [
+        "prompt-directed-shell-execution:SKILL.md"
+      ],
+      "filePaths": [
+        "SKILL.md"
+      ]
+    }
+  ],
+  "topRisks": [
+    {
+      "title": "Suspicious package pattern group",
+      "summary": "SKILL.md contains related findings: bootstrap-installer.",
+      "severity": "medium",
+      "signalTypes": [
+        "documentation"
+      ],
+      "categories": [
+        "bootstrap-installer"
+      ],
+      "filePaths": [
+        "SKILL.md"
+      ],
+      "exploitability": "reference-only",
+      "exploitabilityReason": "The evidence is documentation-only and does not appear to auto-execute on its own.",
+      "recommendedAction": "monitor",
+      "recommendedActionReason": "This evidence is low-friction reference material and can be monitored unless stronger signals appear.",
+      "groupId": "SKILL.md:bootstrap-installer"
+    },
+    {
+      "title": "Operator prompted to run shell commands",
+      "summary": "SKILL.md instructs the operator to run shell commands manually.",
+      "severity": "medium",
+      "signalTypes": [
+        "documentation"
+      ],
+      "categories": [
+        "prompt-directed-shell-execution"
+      ],
+      "filePaths": [
+        "SKILL.md"
+      ],
+      "exploitability": "operator-assisted",
+      "exploitabilityReason": "The package relies on operator instructions rather than automatic execution.",
+      "recommendedAction": "review",
+      "recommendedActionReason": "This skill relies on operator action, but the instructions are risky enough that it should be reviewed before trust.",
+      "groupId": "SKILL.md:prompt-directed-shell-execution"
+    }
+  ]
+}

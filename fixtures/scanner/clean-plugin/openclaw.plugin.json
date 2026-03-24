@@ -1,0 +1,26 @@
+{
+  "id": "clean-plugin",
+  "name": "Clean Plugin Fixture",
+  "description": "Fixture for safe plugin scans",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["audit", "warn", "enforce"],
+        "default": "warn"
+      },
+      "defaultPolicy": {
+        "type": "string",
+        "enum": ["allow", "deny", "require-consent"],
+        "default": "require-consent"
+      },
+      "audit": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true }
+        }
+      }
+    }
+  }
+}
