@@ -4,6 +4,14 @@
   "type": "module",
   "description": "Scanner-first trust layer for poisoned skills, plugins, drift review, and runtime policy in OpenClaw",
   "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentpassportai/agent-passport-plugin.git"
+  },
+  "homepage": "https://github.com/agentpassportai/agent-passport-plugin",
+  "bugs": {
+    "url": "https://github.com/agentpassportai/agent-passport-plugin/issues"
+  },
   "keywords": [
     "openclaw",
     "plugin",
