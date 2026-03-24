@@ -1,5 +1,5 @@
 import { getLatestScanReview, type PassportScanDecision } from "./review.js";
-import { listPluginInstalls } from "./install-ledger.js";
+import { listPluginInstalls, pruneMissingPluginInstalls } from "./install-ledger.js";
 import { scanPath } from "./scanner/index.js";
 import { updateRereviewState } from "./rereview-state.js";
 
@@ -13,6 +13,14 @@ export type PassportRereviewItem = {
   currentRecommendation: string;
   currentReviewDecision: PassportScanDecision | null;
   reason: string;
+};
+
+export type PassportMissingInstallRecord = {
+  pluginId: string;
+  pluginName: string;
+  sourcePath: string;
+  recordedFingerprint: string;
+  installedAt: string;
 };
 
 export async function listPluginsNeedingRereview(): Promise<PassportRereviewItem[]> {
@@ -49,6 +57,7 @@ export async function listPluginsNeedingRereview(): Promise<PassportRereviewItem
 }
 
 export async function sweepRereviewQueue() {
+  const cleanup = await pruneMissingPluginInstalls();
   const queue = await listPluginsNeedingRereview();
   const state = await updateRereviewState({
     active: queue.map((item) => ({ pluginId: item.pluginId, fingerprint: item.currentFingerprint }))
@@ -58,15 +67,24 @@ export async function sweepRereviewQueue() {
     state.newlySeen.some((seen) => seen.pluginId === item.pluginId && seen.fingerprint === item.currentFingerprint)
   );
   const resolved = state.resolved;
+  const skippedMissing = cleanup.removed.map((record) => ({
+    pluginId: record.pluginId,
+    pluginName: record.pluginName,
+    sourcePath: record.sourcePath,
+    recordedFingerprint: record.fingerprint,
+    installedAt: record.installedAt
+  } satisfies PassportMissingInstallRecord));
 
   return {
     queue,
     newlyEntered,
     resolved,
+    skippedMissing,
     summary: {
       queueCount: queue.length,
       newCount: newlyEntered.length,
-      resolvedCount: resolved.length
+      resolvedCount: resolved.length,
+      skippedMissingCount: skippedMissing.length
     }
   };
 }
@@ -77,6 +95,7 @@ export async function buildDriftAlerts() {
     alert: result.summary.newCount > 0,
     newlyEntered: result.newlyEntered,
     resolved: result.resolved,
+    skippedMissing: result.skippedMissing,
     summary: result.summary,
     nextCommand: "/passport workspace-state"
   };

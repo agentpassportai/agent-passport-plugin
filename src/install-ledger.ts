@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { PassportScanDecision, PassportScanReview } from "./review.js";
 import type { ScannerReport } from "./scanner/types.js";
@@ -147,5 +147,29 @@ export async function markPluginEnabled(input: { pluginId: string; enabledAt?: s
     store.installs = store.installs.map((record) => record.id === target.id ? { ...record, enabledAt } : record);
     await writeStoreAtomically(store, storePath);
     return { ...target, enabledAt };
+  });
+}
+
+export async function pruneMissingPluginInstalls(input?: { storePath?: string }) {
+  const storePath = input?.storePath ?? getStorePath();
+  return withStoreLock(storePath, async () => {
+    const store = await loadPluginInstallStore(storePath);
+    const kept: PassportPluginInstallRecord[] = [];
+    const removed: PassportPluginInstallRecord[] = [];
+
+    for (const record of store.installs) {
+      try {
+        await stat(record.sourcePath);
+        kept.push(record);
+      } catch {
+        removed.push(record);
+      }
+    }
+
+    if (removed.length) {
+      await writeStoreAtomically({ installs: kept }, storePath);
+    }
+
+    return { kept, removed };
   });
 }
