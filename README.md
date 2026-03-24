@@ -1,10 +1,16 @@
 # Agent Passport
 
 Status: draft release candidate  
-Package: `@agentholdings/agent-passport`  
+NPM package: `@agentholdings/agent-passport`  
+ClawHub package: `agent-passport-plugin`  
 Plugin id: `agent-passport`
 
-Note: the npm package name and the runtime plugin id are intentionally different. Install from npm with `@agentholdings/agent-passport`, then enable or inspect the plugin as `agent-passport` inside OpenClaw.
+Note: Agent Passport now has three names in play on purpose:
+- install from npm with `@agentholdings/agent-passport`
+- find it on ClawHub as `agent-passport-plugin`
+- enable or inspect it inside OpenClaw as `agent-passport`
+
+The split exists because ClawHub package names must match `package.json` and share a namespace with skill slugs. `agent-passport` was already taken there, so the ClawHub listing uses `agent-passport-plugin` while npm and the runtime plugin id stay cleaner for real OpenClaw use.
 
 Agent Passport is a trust layer for OpenClaw packages and actions.
 
