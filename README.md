@@ -1,6 +1,6 @@
 # Agent Passport
 
-Status: live local draft  
+Status: draft release candidate  
 Package: `@agentpassport/agent-passport`  
 Plugin id: `agent-passport`
 
