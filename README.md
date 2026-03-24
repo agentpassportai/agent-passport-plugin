@@ -358,7 +358,7 @@ npm run scan:regression
 npm run drift:alerts:json
 ```
 
-The package tarball now includes the local `scripts/` and `fixtures/` folders used by these helper commands, so the documented regression and drift CLI surfaces match the actual package contents.
+Those helper scripts and regression fixtures live in the source repo for development and validation. They are not part of the published package tarball.
 
 ## Commands
 

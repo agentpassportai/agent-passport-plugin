@@ -24,8 +24,6 @@
   ],
   "files": [
     "src",
-    "scripts",
-    "fixtures",
     "README.md",
     "RELEASE-NOTES.md",
     "LICENSE",
