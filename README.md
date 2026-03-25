@@ -20,6 +20,8 @@ The core idea is simple:
 
 This is the honest product shape now. Not a fake universal interceptor. Not a chat-locking demo. A real scanner-first trust layer with runtime containment on the surfaces Passport actually controls.
 
+Security scope and local state are documented in [SECURITY-SCOPE.md](./SECURITY-SCOPE.md).
+
 ## Why this exists
 
 ClawHavoc-style poisoned skills, plugins, and package flows are the real problem.
@@ -109,13 +111,22 @@ This draft already proves real product surface, not just theory.
 - proactive drift sweep and drift alerts
 - cron/shell-friendly alerts CLI
 
+### Local state
+Passport stores its review and operating state locally in the workspace unless configured otherwise:
+- scan review decisions are fingerprint-bound
+- plugin install records capture source path, manifest path, fingerprint, and review state
+- skill review records capture slug, skill directory, fingerprint, and review state
+- consent grants and requests are local and temporary
+- drift queue state is local and used only to surface re-review work
+- audit logs are local JSONL records and should be treated as sensitive operator data
+
 ### Runtime containment already in draft
 Passport also has a real runtime consent and audit lane on supported surfaces:
 - `message_sending`
 - `message.send`
 - `sessions_send`
 
-That matters. It is just no longer the whole headline.
+That matters. It is the runtime enforcement Passport actually owns today, and it is not a claim about universal interception.
 
 ## What Agent Passport does not claim
 
@@ -410,6 +421,15 @@ Those helper scripts and regression fixtures live in the source repo for develop
 - `/passport workspace-state`
 - `/passport drift-sweep`
 - `/passport drift-alerts`
+
+## Public Surface
+
+The default public-facing story should stay read-only and review-oriented:
+- scan, status, state, drift, and explain flows are the safest public entry points
+- install, enable, update, trust, review, block, and consent-grant flows are explicit operator actions
+- mutating flows are higher-risk and should be used deliberately, not treated as ambient assistant behavior
+
+If you are documenting or publishing Passport on ClawHub, this distinction matters more than the command count.
 
 ## Tools
 - `agent_passport_status`
