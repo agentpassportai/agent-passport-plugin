@@ -3,8 +3,9 @@ import { evidenceFromMatch, inferSignalType } from "./shared.js";
 
 const SUSPICIOUS_EGRESS_PATTERNS = [
   /https?:\/\/(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:\/[^\s"')>]*)?/gi,
-  /https?:\/\/(?:pastebin\.com|webhook\.site|transfer\.sh|ngrok\.io|discord(?:app)?\.com\/api\/webhooks|raw\.githubusercontent\.com)[^\s"')>]*/gi,
-  /nc\s+-e\s+|bash\s+-i\s*>\&\s*\/dev\/tcp/gi
+  /https?:\/\/(?:pastebin\.com|webhook\.site|transfer\.sh|ngrok\.io|discord(?:app)?\.com\/api\/webhooks|raw\.githubusercontent\.com|hooks\.slack\.com|slack\.com\/api\/webhook|api\.telegram\.org|requestbin\.net|hookbin\.com)[^\s"')>]*/gi,
+  /(?:curl|wget|Invoke-WebRequest)[^\n]*(?:--data(?:-binary)?|-d|payload|body)[^\n]*https?:\/\//gi,
+  /(?:nc\s+-e\s+|bash\s+-i\s*>\&\s*\/dev\/tcp|powershell[^\n]*DownloadString|certutil\s+-urlcache|bitsadmin\s+\/transfer|mshta\b|regsvr32\b|rundll32\b)/gi
 ];
 
 export const suspiciousEgressRule: ScannerRule = (context) => {

@@ -17,9 +17,11 @@ function findingPriority(finding: ScannerFinding) {
   const signalRank = finding.signalType === "executable" ? 3 : finding.signalType === "config" ? 2 : 1;
   const categoryBonus = finding.category === "manifest-lifecycle"
     ? 3
+    : finding.category === "bootstrap-installer"
+      ? 3
     : finding.category === "staged-payload" || finding.category === "persistence-autorun"
       ? 2
-      : 0;
+    : 0;
   return severityRank * 10 + signalRank * 3 + categoryBonus;
 }
 
@@ -54,6 +56,12 @@ function summarizeGroup(findings: ScannerFinding[]) {
       summary: `${primaryPath} contains package lifecycle hooks that run suspicious install-time commands.`
     };
   }
+  if (categories.includes("bootstrap-installer") && filePaths.some((filePath) => /\.(?:md|markdown|txt)$/i.test(filePath) || /(?:README|SKILL)\b/i.test(filePath))) {
+    return {
+      title: "Documentation-driven install chain",
+      summary: `${primaryPath} uses install, setup, or bootstrap instructions to push executable shell steps into the trust flow.`
+    };
+  }
   if (categories.includes("remote-script-execution") && categories.includes("bootstrap-installer")) {
     return {
       title: "Installer executes remote code",
@@ -73,6 +81,12 @@ function summarizeGroup(findings: ScannerFinding[]) {
     };
   }
   if (categories.includes("credential-harvest")) {
+    if (categories.includes("suspicious-egress")) {
+      return {
+        title: "Credential harvest with exfiltration path",
+        summary: `${primaryPath} references credential-bearing material and also points at suspicious outbound destinations.`
+      };
+    }
     return {
       title: "Credential-bearing material referenced",
       summary: `${primaryPath} references secrets or credential-bearing material that needs justification.`
@@ -102,10 +116,10 @@ function inferExploitability(findings: ScannerFinding[]): { exploitability: Scan
   const signalTypes = dedupe(findings.map((finding) => finding.signalType));
 
   if (signalTypes.every((signalType) => signalType === "documentation")) {
-    if (categories.includes("prompt-directed-shell-execution")) {
+    if (categories.includes("prompt-directed-shell-execution") || categories.includes("bootstrap-installer") || categories.includes("staged-payload") || categories.includes("persistence-autorun")) {
       return {
         exploitability: "operator-assisted",
-        reason: "The package relies on operator instructions rather than automatic execution."
+        reason: "The evidence relies on operator instructions or documented install-time behavior rather than automatic execution."
       };
     }
     return {

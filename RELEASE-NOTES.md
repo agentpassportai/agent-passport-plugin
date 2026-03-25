@@ -1,32 +1,3 @@
-# Agent Passport 0.1.0
+Agent Passport 0.1.1 cleans up the ClawHub release surface.
 
-First draft release of Agent Passport as a native OpenClaw plugin.
-
-Naming note:
-- npm package: `@agentholdings/agent-passport`
-- ClawHub package: `agent-passport-plugin`
-- OpenClaw runtime plugin id: `agent-passport`
-
-This split is intentional. ClawHub package names must match `package.json` and share a namespace with skill slugs, so the ClawHub listing ships as `agent-passport-plugin` while the runtime plugin id remains `agent-passport`.
-
-## Included in this release
-- scanner-first trust for skills, plugins, and package-like artifacts
-- review decisions bound to exact fingerprints
-- plugin install, enable, and update wrappers over real OpenClaw commands
-- skill state, review, drift, and update wrappers aligned with real OpenClaw skill flows
-- re-review queues for drifted plugins and skills
-- a workspace-level operator view with Telegram actions for the top items that need attention
-- runtime consent and audit controls on supported message and session-send paths
-
-## What it does not claim
-- universal interception of all dangerous actions
-- remote preinstall scanning for every package source
-- full runtime containment across all OpenClaw surfaces
-
-## Focus
-Agent Passport starts with poisoned-package defense:
-- scan before trust
-- authorize where hooks exist
-- re-review when artifacts drift
-
-The README has the current product story and workflow examples.
+This release removes regression fixtures, helper scripts, and internal planning docs from the published ClawHub artifact so the listing reflects the actual plugin package. The plugin itself is unchanged in purpose: scanner-first trust, fingerprint-bound review, drift-aware rereview, and runtime policy checks on the OpenClaw surfaces Passport actually controls.

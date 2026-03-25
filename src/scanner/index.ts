@@ -16,7 +16,7 @@ import type { ScannerFile, ScannerReport, ScannerRule, ScannerTargetKind, Scanne
 const DEFAULT_MAX_FILES = 200;
 const DEFAULT_MAX_BYTES = 256_000;
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next"]);
-const ALLOWED_EXTENSIONS = new Set([".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".bash", ".zsh", ".ps1", ".js", ".ts", ".mjs", ".cjs"]);
+const ALLOWED_EXTENSIONS = new Set([".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".sh", ".bash", ".zsh", ".ps1", ".js", ".ts", ".mjs", ".cjs"]);
 const SPECIAL_FILENAMES = new Set(["SKILL.md", "README", "README.md", "package.json", "openclaw.plugin.json"]);
 const SKIP_FILES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"]);
 const SCANNER_RULES: ScannerRule[] = [

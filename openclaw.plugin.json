@@ -21,11 +21,6 @@
         },
         "default": {}
       },
-      "defaultPolicy": {
-        "type": "string",
-        "enum": ["allow", "deny", "require-consent"],
-        "default": "require-consent"
-      },
       "trustedTargets": {
         "type": "array",
         "items": { "type": "string" },
@@ -57,24 +52,11 @@
         "minimum": 1,
         "default": 60
       },
-      "categories": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "exec": { "type": "string", "enum": ["allow", "deny", "require-consent"] },
-          "externalMessaging": { "type": "string", "enum": ["allow", "deny", "require-consent"] },
-          "privateNetworkAccess": { "type": "string", "enum": ["allow", "deny", "require-consent"] },
-          "fileDelete": { "type": "string", "enum": ["allow", "deny", "require-consent"] },
-          "configMutation": { "type": "string", "enum": ["allow", "deny", "require-consent"] },
-          "pluginInstall": { "type": "string", "enum": ["allow", "deny", "require-consent"] }
-        }
-      },
       "audit": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": true },
-          "store": { "type": "string", "enum": ["local-jsonl"], "default": "local-jsonl" },
           "path": { "type": "string", "default": ".openclaw/agent-passport/audit.jsonl" }
         }
       }

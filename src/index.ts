@@ -6,7 +6,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "@sinclair/typebox";
 import { evaluateAction } from "./policy/engine.js";
 import { evaluateOutboundCommunication } from "./policy/outbound-comms.js";
-import { appendAuditRecord } from "./audit.js";
+import { appendAuditRecord, configureAuditRuntime } from "./audit.js";
 import { scanPath } from "./scanner/index.js";
 import type { ScannerFinding, ScannerReport } from "./scanner/types.js";
 import { getLatestScanReview, listScanReviews, recordScanReview, type PassportScanDecision, type PassportScanReview } from "./review.js";
@@ -41,6 +41,10 @@ type PassportPluginConfig = {
   trustedTargets?: string[];
   trustedTargetRules?: TrustedTargetRule[];
   consentTtlMinutes?: number;
+  audit?: {
+    enabled?: boolean;
+    path?: string;
+  };
 };
 
 type LoadedPluginConfig = {
@@ -49,12 +53,20 @@ type LoadedPluginConfig = {
   trustedTargets: string[];
   trustedTargetRules: TrustedTargetRule[];
   consentTtlMinutes: number;
+  audit: {
+    enabled: boolean;
+    path?: string;
+  };
 };
 
 const GUARDED_SCOPES: GuardedScope[] = ["message_sending", "message.send", "sessions_send"];
 const TELEGRAM_NAMESPACE = "passport";
+const OPTIONAL_MUTATING_TOOL = { optional: true } as const;
 
 function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPluginConfig {
+  const auditConfig = raw?.audit && typeof raw.audit === "object"
+    ? raw.audit as { enabled?: unknown; path?: unknown }
+    : undefined;
   const trustedTargets = Array.isArray(raw?.trustedTargets)
     ? raw.trustedTargets.filter((x): x is string => typeof x === "string").map((x) => x.trim().toLowerCase())
     : [];
@@ -66,7 +78,7 @@ function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPlugin
         if (!target) return [];
         const paths = Array.isArray(value.paths)
           ? value.paths.filter(
-              (path): path is TrustedPathScope =>
+              (path: unknown): path is TrustedPathScope =>
                 typeof path === "string" && ["all", "message_sending", "message.send", "sessions_send"].includes(path)
             )
           : ["all"];
@@ -93,7 +105,11 @@ function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPlugin
     pathModes,
     trustedTargets,
     trustedTargetRules,
-    consentTtlMinutes: typeof raw?.consentTtlMinutes === "number" && raw?.consentTtlMinutes > 0 ? Math.floor(raw.consentTtlMinutes) : 60
+    consentTtlMinutes: typeof raw?.consentTtlMinutes === "number" && raw?.consentTtlMinutes > 0 ? Math.floor(raw.consentTtlMinutes) : 60,
+    audit: {
+      enabled: typeof auditConfig?.enabled === "boolean" ? auditConfig.enabled : true,
+      path: typeof auditConfig?.path === "string" ? auditConfig.path : undefined
+    }
   };
 }
 
@@ -228,7 +244,9 @@ async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
       `- tracked skills: ${skills.length}`,
       `- plugin re-review queue: ${rereviewQueue.length}`,
       `- skill re-review queue: ${skillRereviewQueue.length}`,
-      `- consent TTL minutes: ${pluginCfg.consentTtlMinutes}`
+      `- consent TTL minutes: ${pluginCfg.consentTtlMinutes}`,
+      `- audit enabled: ${pluginCfg.audit.enabled ? "yes" : "no"}`,
+      `- audit path: ${pluginCfg.audit.path ?? ".openclaw/agent-passport/audit.jsonl"}`
     ].join("\n"),
     interactive: pendingRequests.length
       ? { blocks: [{ type: "buttons", buttons: [{ label: `Review ${pendingRequests.length} pending`, value: "requests", style: "primary" }] }] }
@@ -955,6 +973,48 @@ async function updateOpenClawPluginFromLedger(input: {
   };
 }
 
+function authorizeSkillUpdateState(state: Awaited<ReturnType<typeof buildSkillState>>) {
+  if (!state.ok) {
+    return {
+      allowed: false,
+      reason: state.reason ?? "Skill state is unavailable, so update should stay blocked."
+    };
+  }
+
+  if (!state.tracked) {
+    return {
+      allowed: false,
+      reason: "Skill is not tracked as a workspace ClawHub install, so Passport should not update it blindly."
+    };
+  }
+
+  if (state.state === "trusted") {
+    return {
+      allowed: true,
+      reason: "Skill is currently trusted for its installed fingerprint."
+    };
+  }
+
+  if (state.state === "rereview-required") {
+    return {
+      allowed: false,
+      reason: "Installed skill drifted since the last trusted review. Re-review and re-trust before update."
+    };
+  }
+
+  if (state.state === "blocked") {
+    return {
+      allowed: false,
+      reason: "Skill is explicitly blocked."
+    };
+  }
+
+  return {
+    allowed: false,
+    reason: `Skill state is ${state.state}. Passport requires an explicit trust decision before update.`
+  };
+}
+
 export async function updateOpenClawSkill(input: {
   slug: string;
   dryRun?: boolean;
@@ -973,12 +1033,15 @@ export async function updateOpenClawSkill(input: {
   const skillDir = resolveWorkspaceSkillDir(slug);
   const beforeState = await buildSkillState({ slug });
   const updateCommand = `openclaw skills update ${shellQuote(slug)}`;
+  const authorization = authorizeSkillUpdateState(beforeState);
 
-  if (input.dryRun) {
+  if (input.dryRun || !authorization.allowed) {
     return {
       slug,
       skillDir,
       updateCommand,
+      authorized: authorization.allowed,
+      authorizationReason: authorization.reason,
       executed: false,
       execution: null,
       beforeState,
@@ -995,6 +1058,8 @@ export async function updateOpenClawSkill(input: {
     slug,
     skillDir,
     updateCommand,
+    authorized: authorization.allowed,
+    authorizationReason: authorization.reason,
     executed: true,
     execution,
     beforeState,
@@ -1009,11 +1074,19 @@ export async function updateAllOpenClawSkills(input?: {
   const slugs = await listTrackedSkillSlugs();
   const beforeStates = await Promise.all(slugs.map(async (slug) => [slug, await buildSkillState({ slug })] as const));
   const updateCommand = "openclaw skills update --all";
+  const authorization = beforeStates
+    .map(([slug, state]) => ({ slug, ...authorizeSkillUpdateState(state) }))
+    .filter((item) => !item.allowed);
 
-  if (input?.dryRun) {
+  if (input?.dryRun || authorization.length > 0) {
     return {
       slugs,
       updateCommand,
+      authorized: authorization.length === 0,
+      authorizationReason: authorization.length === 0
+        ? "All tracked skills are currently trusted for their installed fingerprint."
+        : `Blocked because ${authorization.length} tracked skill(s) are not trusted for update.`,
+      blocked: authorization,
       executed: false,
       execution: null,
       beforeStates,
@@ -1059,6 +1132,9 @@ export async function updateAllOpenClawSkills(input?: {
   return {
     slugs,
     updateCommand,
+    authorized: true,
+    authorizationReason: "All tracked skills were trusted for update.",
+    blocked: [],
     executed: true,
     execution,
     beforeStates,
@@ -1551,6 +1627,10 @@ async function handleConsentRequired(input: {
     return;
   }
 
+  if (scope === "message_sending") {
+    return { cancel: true as const };
+  }
+
   return {
     block: true,
     blockReason: buildDecisionText("Agent Passport blocked outbound action pending explicit consent", decision.matchedRule, effectiveMode, request.id)
@@ -1562,7 +1642,13 @@ export default definePluginEntry({
   name: "Agent Passport",
   description: "Scanner-first trust layer for poisoned skills, plugins, drift review, runtime policy checks, and audit logging in OpenClaw",
   register(api) {
-    const currentConfig = () => getPluginConfig((api.pluginConfig ?? {}) as Record<string, unknown>);
+    const currentConfig = () => {
+      const cfg = getPluginConfig((api.pluginConfig ?? {}) as Record<string, unknown>);
+      configureAuditRuntime(cfg.audit);
+      return cfg;
+    };
+
+    currentConfig();
 
     api.on("message_sending", async (event, ctx) => {
       const pluginCfg = currentConfig();
@@ -1905,6 +1991,8 @@ export default definePluginEntry({
                 `Agent Passport skill update wrapper: ${slug}`,
                 `- skill dir: ${result.skillDir}`,
                 `- command: ${result.updateCommand}`,
+                `- authorized: ${result.authorized ? "yes" : "no"}`,
+                `- authorization reason: ${result.authorizationReason}`,
                 `- executed: ${result.executed ? "yes" : "no"}`,
                 ...(result.execution ? [
                   `- success: ${result.execution.ok ? "yes" : "no"}`,
@@ -1929,6 +2017,8 @@ export default definePluginEntry({
               text: [
                 "Agent Passport skills update wrapper:",
                 `- command: ${result.updateCommand}`,
+                `- authorized: ${result.authorized ? "yes" : "no"}`,
+                `- authorization reason: ${result.authorizationReason}`,
                 `- executed: ${result.executed ? "yes" : "no"}`,
                 ...(result.execution ? [
                   `- success: ${result.execution.ok ? "yes" : "no"}`,
@@ -1941,6 +2031,7 @@ export default definePluginEntry({
                 `- blocked: ${result.summary.blockedCount}`,
                 `- re-review required: ${result.summary.rereviewRequiredCount}`,
                 `- missing: ${result.summary.missingCount}`,
+                ...(result.blocked.length ? ["", "Blocked skills:", ...result.blocked.map((item) => `- ${item.slug}: ${item.reason}`)] : []),
                 "",
                 "Skill states:",
                 ...states.map(([slug, state]) => `- ${slug}: ${state.state}${state.installedVersion ? ` (${state.installedVersion})` : ""}`)
@@ -2476,7 +2567,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_skill",
@@ -2501,7 +2592,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_plugin",
@@ -2526,7 +2617,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_preflight_artifact",
@@ -2588,7 +2679,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_install_openclaw_plugin",
@@ -2607,7 +2698,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_enable_openclaw_plugin",
@@ -2623,7 +2714,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_update_openclaw_plugin",
@@ -2639,7 +2730,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_plugin_installs",
@@ -2754,7 +2845,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_update_all_openclaw_skills",
@@ -2769,7 +2860,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_skills_rereview_queue",
@@ -2806,7 +2897,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_drift_alerts",
@@ -2819,7 +2910,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_scan_reviews",
@@ -2898,7 +2989,7 @@ export default definePluginEntry({
           }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_consents",
@@ -2925,7 +3016,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_request_consent",
@@ -2946,7 +3037,7 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(request, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_requests",
@@ -2989,6 +3080,6 @@ export default definePluginEntry({
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
       }
-    });
+    }, OPTIONAL_MUTATING_TOOL);
   }
 });
