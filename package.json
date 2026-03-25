@@ -1,6 +1,6 @@
 {
-  "name": "@agentholdings/agent-passport",
-  "version": "0.1.0",
+  "name": "agent-passport-plugin",
+  "version": "0.1.1",
   "type": "module",
   "description": "Scanner-first trust layer for poisoned skills, plugins, drift review, and runtime policy in OpenClaw",
   "license": "SEE LICENSE IN LICENSE",
