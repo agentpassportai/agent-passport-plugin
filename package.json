@@ -46,7 +46,7 @@
   "scripts": {
     "pack:dry": "npm pack --dry-run",
     "test": "node --import tsx --test --test-concurrency=1 tests/index.test.ts",
-    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts"
+    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/provenance.ts src/skill-inspection.ts src/workspace-audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts tests/skill-inspection.test.ts tests/workspace-audit.test.ts"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
