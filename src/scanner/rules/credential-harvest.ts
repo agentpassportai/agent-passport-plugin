@@ -2,11 +2,13 @@ import type { ScannerFinding, ScannerRule } from "../types.js";
 import { evidenceFromMatch, inferSignalType, isScannerImplementationFile } from "./shared.js";
 
 const CREDENTIAL_PATTERNS = [
-  /~\/\.ssh|\.ssh\/id_rsa|authorized_keys/gi,
-  /\.aws\/credentials|aws_access_key_id|aws_secret_access_key/gi,
-  /browser\s+cookies|Login Data|Cookies\b/gi,
-  /keychain|credential manager|password manager|credential store/gi,
-  /(?:^|[\s\"'`=:(/])\.env(?:\.[\w-]+)?\b|api[ _-]?key\b|bearer\s+[A-Za-z0-9._-]{12,}|x-api-key\b/gi
+  /~\/\.ssh|\.ssh\/id_(?:rsa|ed25519|ecdsa)|authorized_keys/gi,
+  /(?:\.aws\/credentials|aws_access_key_id|aws_secret_access_key|aws_session_token|aws_profile|credential_process)/gi,
+  /(?:browser\s+cookies?|browser\s+profile|chrome(?:ium)?\/default\/cookies|login data|cookies\b|local storage|session storage|indexeddb)/gi,
+  /(?:keychain|credential manager|password manager|credential store|keyring|gnome-keyring)/gi,
+  /(?:mnemonic|seed phrase|secret recovery phrase|private key|wallet|phantom|metamask|solana|ledger|trezor)/gi,
+  /(?:^|[\s\"'`=:(/])\.env(?:\.[\w-]+)?\b|(?:api[ _-]?key|x-api-key|oauth(?:\s+)?token|refresh\s+token|access\s+token|session\s+token)\b/gi,
+  /(?:\.kube\/config|kubeconfig|docker\/config\.json|id_rsa|id_ed25519|known_hosts)/gi
 ];
 
 function shouldIgnoreCredentialMatch(relativePath: string) {

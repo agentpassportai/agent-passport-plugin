@@ -19,7 +19,9 @@ const SUSPICIOUS_COMMAND_PATTERNS = [
   /\bnode\s+-e\b/i,
   /\bpython(?:3)?\s+-c\b/i,
   /(?:chmod\s+\+x|\.\/|\/tmp\/|mktemp)/i,
-  /(?:systemctl\s+enable|crontab\s+|LaunchAgents|CurrentVersion\\Run)/i
+  /(?:systemctl\s+enable|crontab\s+|LaunchAgents|CurrentVersion\\Run)/i,
+  /(?:launchctl\s+(?:load|bootstrap|enable|kickstart)|schtasks(?:\.exe)?\s+\/create|update-rc\.d|rc-update|chkconfig)/i,
+  /(?:bitsadmin\s+\/transfer|certutil\s+-urlcache|mshta\b|regsvr32\b|rundll32\b)/i
 ];
 
 export const manifestLifecycleRule: ScannerRule = (context) => {
@@ -38,8 +40,8 @@ export const manifestLifecycleRule: ScannerRule = (context) => {
     const scripts = parsed?.scripts;
     if (!scripts || typeof scripts !== "object") continue;
 
-    const suspiciousHooks = Object.entries(scripts)
-      .filter(([name, command]) => LIFECYCLE_HOOKS.has(name) && typeof command === "string")
+    const suspiciousHooks = (Object.entries(scripts) as Array<[string, unknown]>)
+      .filter((entry): entry is [string, string] => LIFECYCLE_HOOKS.has(entry[0]) && typeof entry[1] === "string")
       .filter(([, command]) => SUSPICIOUS_COMMAND_PATTERNS.some((pattern) => pattern.test(command)));
 
     if (!suspiciousHooks.length) continue;

@@ -2,11 +2,17 @@ import type { ScannerFinding, ScannerRule } from "../types.js";
 import { evidenceFromMatch, inferSignalType, isScannerImplementationFile } from "./shared.js";
 
 const PERSISTENCE_PATTERNS = [
-  /systemctl\s+enable\s+/gi,
-  /systemctl\s+(?:start|restart)\s+[\w.-]+/gi,
+  /systemctl\s+(?:--user\s+)?enable\s+/gi,
+  /systemctl\s+(?:start|restart|enable)\s+[\w.-]+/gi,
+  /launchctl\s+(?:load|bootstrap|enable|kickstart)\b/gi,
+  /schtasks(?:\.exe)?\s+\/create\b/gi,
+  /update-rc\.d\s+/gi,
+  /rc-update\s+(?:add|del)\s+/gi,
+  /chkconfig\s+/gi,
   /crontab\s+-[elr]|crontab\s+[^\n]+/gi,
-  /(?:\/etc\/cron\.(?:d|daily|hourly|weekly|monthly)|~\/\.config\/autostart|~\/Library\/LaunchAgents|HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run)/gi,
-  /(?:>>|tee\s+-a)\s+(?:~\/\.(?:bashrc|zshrc|profile)|\/etc\/(?:profile|bash\.bashrc))/gi
+  /(?:\/etc\/cron\.(?:d|daily|hourly|weekly|monthly)|~\/\.config\/autostart|~\/Library\/LaunchAgents|~\/\.config\/systemd\/user|\/etc\/systemd\/system)/gi,
+  /(?:>>|tee\s+-a)\s+(?:~\/\.(?:bashrc|zshrc|profile|bash_profile|zprofile)|\/etc\/(?:profile|bash\.bashrc|bashrc))/gi,
+  /(?:HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce?|HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce?)/gi
 ];
 
 export const persistenceAutorunRule: ScannerRule = (context) => {
