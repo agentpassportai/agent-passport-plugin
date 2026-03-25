@@ -10,6 +10,7 @@ Typical local records are:
 - `scan-reviews.json` for fingerprint-bound trust, review, and block decisions
 - `plugin-installs.json` for recorded plugin source, fingerprint, and install state
 - `skill-reviews.json` for tracked skill review state
+- `skill-inspection/quarantine/` for staged local skill artifacts that are copied into a review area before trust
 - `consents.json` for temporary outbound consent grants and requests
 - `rereview-state.json` for drift queue tracking
 - `audit.jsonl` for audit events when audit logging is enabled
@@ -41,11 +42,12 @@ The public, read-only surface is:
 - scan
 - status
 - state
+- workspace incident audit
 - drift inspection
 - queue inspection
 - explain-only policy views
 
-Operator actions such as install, enable, update, trust, review, block, and consent grant are higher-risk and should be treated as explicit workflows, not ambient defaults.
+Operator actions such as install, enable, update, trust, review, block, consent grant, and quarantined skill staging are higher-risk and should be treated as explicit workflows, not ambient defaults.
 
 ## Handling Rule
 

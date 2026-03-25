@@ -73,6 +73,7 @@ These parts are already implemented.
 
 ### Skill governance
 - tracked workspace skill visibility based on real ClawHub metadata
+- local-first quarantine inspection helper for staging skill artifacts before trust
 - slug-level review actions for installed skills
 - skill drift detection against the last Passport-reviewed fingerprint
 - single-skill and workspace-wide skill update wrappers over real OpenClaw skill update flows
@@ -81,6 +82,7 @@ These parts are already implemented.
 ### Operator workflow
 - single-item truth views for plugins and skills
 - combined `/passport workspace-state` view across plugins and skills
+- ranked `/passport workspace-audit` incident-response view with remediation targets
 - Telegram action buttons from the workspace view
 - proactive drift sweep and drift alerts
 - cron/shell-friendly alerts CLI
@@ -195,6 +197,7 @@ Skills are handled as skills, not treated like plugin clones.
 OpenClaw skills are ClawHub slug-based, not local-path plugin installs. Passport focuses on installed-state truth, review state, and drift-aware re-review.
 
 ### Real skill commands
+- `/passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]`
 - `/passport skills`
 - `/passport skill-state <slug>`
 - `/passport trust-skill <slug>`
@@ -221,6 +224,8 @@ Passport does **not** yet claim remote preinstall scanning of ClawHub packages b
 ## Workspace operator view
 
 `/passport workspace-state` is the top-level operator view.
+
+`/passport workspace-audit` is the incident-response view. It re-ranks tracked plugins and skills by risk, highlights remediation targets, and gives a concrete next-step list after a ClawHavoc-style event.
 
 It rolls up tracked plugins and tracked skills into one summary, then shows the items that currently need attention.
 
@@ -307,7 +312,13 @@ Passport includes a proactive drift layer.
 - `/passport drift-sweep`
 - `/passport drift-alerts`
 
-Use the in-product Passport commands above as the supported operator surface.
+### CLI
+```bash
+openclaw passport-audit
+openclaw passport-inspect-skill /path/to/skill
+```
+
+Use the in-product Passport commands above as the primary operator surface. The explicit OpenClaw CLI entrypoints are there for automation and shell-driven workflows.
 
 ## Install and local development
 
@@ -350,6 +361,7 @@ From the repo root, use `npm pack --dry-run` to confirm the published surface is
 - `/passport rereview-queue`
 
 ### Skills
+- `/passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]`
 - `/passport skills`
 - `/passport skill-state <slug>`
 - `/passport trust-skill <slug>`
@@ -362,6 +374,7 @@ From the repo root, use `npm pack --dry-run` to confirm the published surface is
 
 ### Workspace
 - `/passport workspace-state`
+- `/passport workspace-audit [--plugins-only|--skills-only] [--max <n>]`
 - `/passport drift-sweep`
 - `/passport drift-alerts`
 
@@ -377,6 +390,7 @@ If you are documenting or publishing Passport on ClawHub, this distinction matte
 ## Tools
 - `agent_passport_status`
 - `agent_passport_scan_path`
+- `agent_passport_inspect_skill_artifact`
 - `agent_passport_explain`
 - `agent_passport_grant_consent`
 - `agent_passport_list_consents`
@@ -397,6 +411,7 @@ If you are documenting or publishing Passport on ClawHub, this distinction matte
 - `agent_passport_check_plugin_drift`
 - `agent_passport_list_rereview_queue`
 - `agent_passport_workspace_state`
+- `agent_passport_workspace_audit`
 - `agent_passport_skill_state`
 - `agent_passport_list_skills_state`
 - `agent_passport_review_skill`

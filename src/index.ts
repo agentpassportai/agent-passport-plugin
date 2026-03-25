@@ -13,6 +13,8 @@ import { getLatestScanReview, listScanReviews, recordScanReview, type PassportSc
 import { getLatestPluginInstall, listPluginInstalls, markPluginEnabled, recordPluginInstall } from "./install-ledger.js";
 import { getLatestSkillReviewRecord, recordSkillReview } from "./skill-review-ledger.js";
 import { buildDriftAlerts, listPluginsNeedingRereview, sweepRereviewQueue } from "./rereview.js";
+import { inspectSkillArtifact } from "./skill-inspection.js";
+import { buildWorkspaceAudit, formatWorkspaceAudit, type WorkspaceAuditOptions } from "./workspace-audit.js";
 import {
   createConsentRequest,
   expandTargetAliases,
@@ -702,6 +704,93 @@ function buildWorkspaceStateReply(input: Awaited<ReturnType<typeof buildWorkspac
     text,
     interactive: buttons.length ? { blocks: buttons.map((row) => ({ type: "buttons" as const, buttons: row })) } : undefined
   };
+}
+
+function parsePositiveIntegerOption(value: string | number | undefined, label: string) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return Math.floor(parsed);
+}
+
+function buildWorkspaceAuditOptions(input: {
+  workspaceRoot?: string;
+  ledgerDir?: string;
+  includePlugins?: boolean;
+  includeSkills?: boolean;
+  pluginsOnly?: boolean;
+  skillsOnly?: boolean;
+  maxItems?: string | number;
+}): WorkspaceAuditOptions {
+  if (input.pluginsOnly && input.skillsOnly) {
+    throw new Error("Choose either plugins-only or skills-only, not both.");
+  }
+
+  return {
+    workspaceRoot: input.workspaceRoot?.trim() || undefined,
+    ledgerDir: input.ledgerDir?.trim() || undefined,
+    includePlugins: input.pluginsOnly ? true : (input.skillsOnly ? false : input.includePlugins),
+    includeSkills: input.skillsOnly ? true : (input.pluginsOnly ? false : input.includeSkills),
+    maxItems: parsePositiveIntegerOption(input.maxItems, "max-items")
+  };
+}
+
+async function inspectSkillArtifactWithReview(input: Parameters<typeof inspectSkillArtifact>[0]) {
+  const inspection = await inspectSkillArtifact(input);
+  const currentReview = inspection.scan ? await getLatestScanReview(inspection.scan.fingerprint) : null;
+  return { inspection, currentReview };
+}
+
+function buildSkillInspectionReply(input: {
+  inspection: Awaited<ReturnType<typeof inspectSkillArtifact>>;
+  currentReview: PassportScanReview | null;
+}) {
+  const { inspection, currentReview } = input;
+  const commandPath = inspection.stage.absoluteSourcePath ?? inspection.stage.sourcePath;
+  const nextSteps: string[] = [];
+
+  if (inspection.stage.sourceKind !== "local-path") {
+    nextSteps.push(`Materialize the skill artifact locally, then rerun /passport inspect-skill ${inspection.stage.sourcePath}.`);
+  } else if (currentReview?.decision === "trust") {
+    nextSteps.push("This fingerprint already has an explicit trust decision.");
+  } else if (currentReview?.decision === "block") {
+    nextSteps.push("Keep this fingerprint blocked until the staged contents are reviewed again.");
+  } else {
+    nextSteps.push(`Review the staged contents, then record /passport review ${commandPath}, /passport trust ${commandPath}, or /passport block ${commandPath}.`);
+  }
+
+  return [
+    "Agent Passport skill inspection:",
+    `- source: ${inspection.stage.sourcePath}`,
+    ...(inspection.stage.absoluteSourcePath ? [`- absolute source: ${inspection.stage.absoluteSourcePath}`] : []),
+    `- source kind: ${inspection.stage.sourceKind}`,
+    `- supported: ${inspection.stage.supported ? "yes" : "no"}`,
+    `- copied into quarantine: ${inspection.stage.copied ? "yes" : "no"}`,
+    `- quarantine root: ${inspection.stage.quarantineRoot}`,
+    ...(inspection.stage.quarantinePath ? [`- quarantine path: ${inspection.stage.quarantinePath}`] : []),
+    ...(inspection.stage.stagedPath ? [`- staged path: ${inspection.stage.stagedPath}`] : []),
+    `- trust tier: ${inspection.trustTier.tier}`,
+    `- trust reason: ${inspection.trustTier.reason}`,
+    ...(inspection.scan ? [
+      `- scanner verdict/recommendation: ${inspection.scan.verdict} / ${inspection.scan.packageRecommendation.action}`,
+      `- fingerprint: ${inspection.scan.fingerprint}`,
+      `- current review: ${currentReview ? decisionSummary(currentReview.decision) : "none recorded for this fingerprint"}`
+    ] : []),
+    `- summary: ${inspection.summary}`,
+    ...(inspection.provenance.limitations.length ? [
+      "",
+      "Limitations:",
+      ...inspection.provenance.limitations.map((line) => `- ${line}`)
+    ] : []),
+    ...(nextSteps.length ? [
+      "",
+      "Next steps:",
+      ...nextSteps.map((line) => `- ${line}`)
+    ] : []),
+    ...(inspection.scan ? ["", buildScanReply(inspection.scan, currentReview)] : [])
+  ].join("\n");
 }
 
 async function buildArtifactPreflight(targetPath: string) {
@@ -2091,6 +2180,81 @@ export default definePluginEntry({
           return reply;
         }
 
+        if (action === "workspace-audit") {
+          try {
+            const maxIndex = tokens.indexOf("--max");
+            if (maxIndex !== -1 && !tokens[maxIndex + 1]) {
+              return { text: "Usage: /passport workspace-audit [--plugins-only|--skills-only] [--max <n>]" };
+            }
+            const auditOptions = buildWorkspaceAuditOptions({
+              pluginsOnly: tokens.includes("--plugins-only"),
+              skillsOnly: tokens.includes("--skills-only"),
+              maxItems: maxIndex !== -1 ? tokens[maxIndex + 1] : undefined
+            });
+            const result = await buildWorkspaceAudit(auditOptions);
+            await appendAuditRecord({ kind: "command_workspace_audit", senderId: ctx.senderId, input: auditOptions, result });
+            return { text: formatWorkspaceAudit(result) };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport workspace-audit failed: ${message}` };
+          }
+        }
+
+        if (action === "inspect-skill") {
+          const argTokens = tokens.slice(1);
+          const pathTokens: string[] = [];
+          let label: string | undefined;
+          let maxFiles: number | undefined;
+          let maxBytes: number | undefined;
+
+          try {
+            for (let index = 0; index < argTokens.length; index += 1) {
+              const token = argTokens[index];
+              if (token === "--label") {
+                label = argTokens[index + 1]?.trim();
+                if (!label) throw new Error("Usage: /passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]");
+                index += 1;
+                continue;
+              }
+              if (token === "--max-files") {
+                if (!argTokens[index + 1]) throw new Error("Usage: /passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]");
+                maxFiles = parsePositiveIntegerOption(argTokens[index + 1], "max-files");
+                index += 1;
+                continue;
+              }
+              if (token === "--max-bytes") {
+                if (!argTokens[index + 1]) throw new Error("Usage: /passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]");
+                maxBytes = parsePositiveIntegerOption(argTokens[index + 1], "max-bytes");
+                index += 1;
+                continue;
+              }
+              pathTokens.push(token);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport inspect-skill failed: ${message}` };
+          }
+
+          const sourcePath = pathTokens.join(" ").trim();
+          if (!sourcePath) {
+            return { text: "Usage: /passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]" };
+          }
+
+          try {
+            const result = await inspectSkillArtifactWithReview({
+              sourcePath,
+              label,
+              maxFiles,
+              maxBytes
+            });
+            await appendAuditRecord({ kind: "command_inspect_skill_artifact", senderId: ctx.senderId, input: { sourcePath, label, maxFiles, maxBytes }, ...result });
+            return { text: buildSkillInspectionReply(result) };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { text: `Agent Passport inspect-skill failed: ${message}` };
+          }
+        }
+
         if (action === "skill-state") {
           const slug = tokens[1]?.trim();
           if (!slug) {
@@ -2347,10 +2511,75 @@ export default definePluginEntry({
         }
 
         return {
-          text: "Usage:\n/passport status\n/passport requests [pending|approved|denied|all]\n/passport scan <path>\n/passport preflight <path>\n/passport authorize <install|enable|update> <path>\n/passport run <install|enable|update> <path> -- <command>\n/passport install-plugin <local-path> [--link] [--pin] [--enable] [--dry-run]\n/passport enable-plugin <local-path> [--dry-run]\n/passport update-plugin <pluginId> [--dry-run]\n/passport update-skill <slug> [--dry-run]\n/passport update-skills [--dry-run]\n/passport installs [pluginId]\n/passport skills\n/passport workspace-state\n/passport skill-state <slug>\n/passport drift-skill <slug>\n/passport skills-rereview\n/passport trust-skill <slug>\n/passport review-skill <slug>\n/passport block-skill <slug>\n/passport plugin-state <pluginId>\n/passport trust-plugin <pluginId>\n/passport review-plugin <pluginId>\n/passport block-plugin <pluginId>\n/passport drift-plugin <pluginId>\n/passport rereview-queue\n/passport drift-sweep\n/passport drift-alerts\n/passport trust <path>\n/passport review <path>\n/passport block <path>\n/passport approve <requestId>\n/passport deny <requestId>"
+          text: "Usage:\n/passport status\n/passport requests [pending|approved|denied|all]\n/passport scan <path>\n/passport inspect-skill <path> [--label <label>] [--max-files <n>] [--max-bytes <n>]\n/passport preflight <path>\n/passport authorize <install|enable|update> <path>\n/passport run <install|enable|update> <path> -- <command>\n/passport install-plugin <local-path> [--link] [--pin] [--enable] [--dry-run]\n/passport enable-plugin <local-path> [--dry-run]\n/passport update-plugin <pluginId> [--dry-run]\n/passport update-skill <slug> [--dry-run]\n/passport update-skills [--dry-run]\n/passport installs [pluginId]\n/passport skills\n/passport workspace-state\n/passport workspace-audit [--plugins-only|--skills-only] [--max <n>]\n/passport skill-state <slug>\n/passport drift-skill <slug>\n/passport skills-rereview\n/passport trust-skill <slug>\n/passport review-skill <slug>\n/passport block-skill <slug>\n/passport plugin-state <pluginId>\n/passport trust-plugin <pluginId>\n/passport review-plugin <pluginId>\n/passport block-plugin <pluginId>\n/passport drift-plugin <pluginId>\n/passport rereview-queue\n/passport drift-sweep\n/passport drift-alerts\n/passport trust <path>\n/passport review <path>\n/passport block <path>\n/passport approve <requestId>\n/passport deny <requestId>"
         };
       }
     });
+
+    api.registerCli((cli) => {
+      cli.program
+        .command("passport-audit")
+        .description("Run the Agent Passport workspace incident-response audit")
+        .option("--workspace-root <path>", "Override the workspace root to audit")
+        .option("--ledger-dir <path>", "Override the Agent Passport ledger directory")
+        .option("--plugins-only", "Audit recorded plugins only")
+        .option("--skills-only", "Audit tracked skills only")
+        .option("--max-items <count>", "Limit the number of top-ranked items shown")
+        .option("--json", "Emit JSON instead of the human-readable summary")
+        .action(async (options: {
+          workspaceRoot?: string;
+          ledgerDir?: string;
+          pluginsOnly?: boolean;
+          skillsOnly?: boolean;
+          maxItems?: string;
+          json?: boolean;
+        }) => {
+          currentConfig();
+          const auditOptions = buildWorkspaceAuditOptions({
+            workspaceRoot: options.workspaceRoot,
+            ledgerDir: options.ledgerDir,
+            pluginsOnly: options.pluginsOnly,
+            skillsOnly: options.skillsOnly,
+            maxItems: options.maxItems
+          });
+          const result = await buildWorkspaceAudit(auditOptions);
+          await appendAuditRecord({ kind: "cli_workspace_audit", input: auditOptions, result });
+          const output = options.json
+            ? JSON.stringify(result, null, 2)
+            : formatWorkspaceAudit(result);
+          process.stdout.write(`${output}\n`);
+        });
+
+      cli.program
+        .command("passport-inspect-skill <path>")
+        .description("Stage a local skill artifact into Passport quarantine and scan it before trust")
+        .option("--label <label>", "Override the quarantine label prefix")
+        .option("--quarantine-root <path>", "Override the quarantine root directory")
+        .option("--max-files <count>", "Limit the number of files scanned")
+        .option("--max-bytes <count>", "Limit the maximum bytes scanned")
+        .option("--json", "Emit JSON instead of the human-readable summary")
+        .action(async (sourcePath: string, options: {
+          label?: string;
+          quarantineRoot?: string;
+          maxFiles?: string;
+          maxBytes?: string;
+          json?: boolean;
+        }) => {
+          currentConfig();
+          const result = await inspectSkillArtifactWithReview({
+            sourcePath,
+            label: options.label,
+            quarantineRoot: options.quarantineRoot,
+            maxFiles: parsePositiveIntegerOption(options.maxFiles, "max-files"),
+            maxBytes: parsePositiveIntegerOption(options.maxBytes, "max-bytes")
+          });
+          await appendAuditRecord({ kind: "cli_inspect_skill_artifact", input: { sourcePath, ...options }, ...result });
+          const output = options.json
+            ? JSON.stringify(result, null, 2)
+            : buildSkillInspectionReply(result);
+          process.stdout.write(`${output}\n`);
+        });
+    }, { commands: ["passport-audit", "passport-inspect-skill"] });
 
     api.registerInteractiveHandler({
       channel: "telegram",
@@ -2544,6 +2773,31 @@ export default definePluginEntry({
         };
       }
     });
+
+    api.registerTool({
+      name: "agent_passport_inspect_skill_artifact",
+      description: "Stage a local skill artifact into Passport quarantine, scan it, and report provenance plus any existing review state for the resulting fingerprint",
+      parameters: Type.Object({
+        path: Type.String(),
+        label: Type.Optional(Type.String()),
+        quarantineRoot: Type.Optional(Type.String()),
+        maxFiles: Type.Optional(Type.Number({ minimum: 1 })),
+        maxBytes: Type.Optional(Type.Number({ minimum: 1 }))
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const result = await inspectSkillArtifactWithReview({
+          sourcePath: params.path,
+          label: params.label,
+          quarantineRoot: params.quarantineRoot,
+          maxFiles: params.maxFiles ? Math.floor(params.maxFiles) : undefined,
+          maxBytes: params.maxBytes ? Math.floor(params.maxBytes) : undefined
+        });
+        await appendAuditRecord({ kind: "tool_inspect_skill_artifact", input: params, ...result });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_scan",
@@ -2770,6 +3024,32 @@ export default definePluginEntry({
         await appendAuditRecord({ kind: "tool_workspace_state", result });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: "agent_passport_workspace_audit",
+      description: "Rank tracked plugins and skills for incident response after a ClawHavoc-style poisoning event",
+      parameters: Type.Object({
+        workspaceRoot: Type.Optional(Type.String()),
+        ledgerDir: Type.Optional(Type.String()),
+        includePlugins: Type.Optional(Type.Boolean()),
+        includeSkills: Type.Optional(Type.Boolean()),
+        maxItems: Type.Optional(Type.Number({ minimum: 1 }))
+      }, { additionalProperties: false }),
+      async execute(_id, params) {
+        const auditOptions = buildWorkspaceAuditOptions({
+          workspaceRoot: params.workspaceRoot,
+          ledgerDir: params.ledgerDir,
+          includePlugins: params.includePlugins,
+          includeSkills: params.includeSkills,
+          maxItems: params.maxItems
+        });
+        const result = await buildWorkspaceAudit(auditOptions);
+        await appendAuditRecord({ kind: "tool_workspace_audit", input: auditOptions, result });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ...result, formatted: formatWorkspaceAudit(result) }, null, 2) }]
         };
       }
     });
