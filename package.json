@@ -1,6 +1,6 @@
 {
-  "name": "agent-passport-plugin",
-  "version": "0.1.1",
+  "name": "@agentholdings/agent-passport",
+  "version": "0.1.2",
   "type": "module",
   "description": "Scanner-first trust layer for poisoned skills, plugins, drift review, and runtime policy in OpenClaw",
   "license": "SEE LICENSE IN LICENSE",
@@ -46,24 +46,7 @@
   "scripts": {
     "pack:dry": "npm pack --dry-run",
     "test": "node --import tsx --test --test-concurrency=1 tests/index.test.ts",
-    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts",
-    "scan:regression": "node ./scripts/scanner-regression.mjs",
-    "scan:regression:update": "node ./scripts/scanner-regression.mjs --update-snapshots",
-    "scan:regression:case": "node ./scripts/scanner-regression.mjs --case",
-    "scan:regression:json": "node ./scripts/scanner-regression.mjs --json",
-    "scan:regression:artifact": "node ./scripts/scanner-regression.mjs --output ./tmp/scanner-regression.json",
-    "scan:regression:fail-fast": "node ./scripts/scanner-regression.mjs --fail-fast",
-    "scan:regression:list": "node ./scripts/scanner-regression.mjs --list-cases",
-    "scan:regression:help": "node ./scripts/scanner-regression.mjs --help",
-    "scan:regression:strict": "node ./scripts/scanner-regression.mjs --strict-categories",
-    "scan:regression:summary": "node ./scripts/scanner-regression.mjs --summary-only",
-    "scan:regression:quiet": "node ./scripts/scanner-regression.mjs --quiet",
-    "scan:regression:quiet:clean": "node ./scripts/scanner-regression.mjs --quiet --no-summary-footer",
-    "scan:regression:counts": "node ./scripts/scanner-regression.mjs --counts-only",
-    "scan:regression:cli": "node ./scripts/scanner-regression-cli-smoke.mjs",
-    "drift:alerts": "node ./scripts/drift-alerts.mjs",
-    "drift:sweep": "node ./scripts/drift-alerts.mjs --mode sweep",
-    "drift:alerts:json": "node ./scripts/drift-alerts.mjs --format json"
+    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

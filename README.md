@@ -1,24 +1,21 @@
 # Agent Passport
 
-Status: draft release candidate  
 NPM package: `@agentholdings/agent-passport`  
 ClawHub package: `agent-passport-plugin`  
 Plugin id: `agent-passport`
 
-Note: Agent Passport now has three names in play on purpose:
+Agent Passport is a trust layer for OpenClaw packages and actions.
+
+**Scan before trust. Authorize before install, enable, or update where hooks exist. Re-review when artifacts drift.**
+
+It is built to catch poisoned skills, plugins, and package updates before they quietly become trusted. Trust decisions are tied to the contents you reviewed, not just a name or path.
+
+The three names are intentional:
 - install from npm with `@agentholdings/agent-passport`
 - find it on ClawHub as `agent-passport-plugin`
 - enable or inspect it inside OpenClaw as `agent-passport`
 
-The split exists because ClawHub package names must match `package.json` and share a namespace with skill slugs. `agent-passport` was already taken there, so the ClawHub listing uses `agent-passport-plugin` while npm and the runtime plugin id stay cleaner for real OpenClaw use.
-
-Agent Passport is a trust layer for OpenClaw packages and actions.
-
-The core idea is simple:
-
-**scan before trust. authorize before install, enable, or update where hooks exist. re-review when artifacts drift.**
-
-This is the honest product shape now. Not a fake universal interceptor. Not a chat-locking demo. A real scanner-first trust layer with runtime containment on the surfaces Passport actually controls.
+ClawHub package names must match `package.json` and share a namespace with skill slugs. `agent-passport` was already taken there, so the ClawHub listing uses `agent-passport-plugin` while npm and the runtime plugin id stay cleaner for normal OpenClaw use.
 
 Security scope and local state are documented in [SECURITY-SCOPE.md](./SECURITY-SCOPE.md).
 
@@ -38,30 +35,7 @@ Agent Passport exists to make that reviewable before trust, then keep trust from
 
 ## What Agent Passport is
 
-Agent Passport is one shared core with two packaging lanes.
-
-### Consumer lane
-For OpenClaw users who want help avoiding sketchy skills and plugins without bricking their control lane.
-
-Priorities:
-- plain-English scan results
-- safe defaults
-- lightweight review and trust decisions
-- control chat stays trusted or audit-only by default
-- optional runtime containment where Passport has real hooks
-
-### Enterprise lane
-For NemoClaw or managed deployments that need package governance, approvals, provenance, drift review, and runtime controls.
-
-Priorities:
-- artifact review workflows
-- explicit trust state
-- re-review on drift
-- auditable authorization decisions
-- runtime containment on supported surfaces
-
-### Shared core
-Both lanes use the same core ideas:
+Agent Passport is built around a few core ideas:
 - fingerprint the artifact you reviewed
 - bind review decisions to content, not just a path string
 - do not let old trust silently survive meaningful drift
@@ -78,9 +52,9 @@ These are non-negotiable.
 - Do not let prior trust silently survive artifact drift.
 - Do use real hook surfaces when enforcing policy.
 
-## What is proven today
+## What is available today
 
-This draft already proves real product surface, not just theory.
+These parts are already implemented.
 
 ### Scanner and review
 - local artifact scanner with explainable findings
@@ -120,17 +94,15 @@ Passport stores its review and operating state locally in the workspace unless c
 - drift queue state is local and used only to surface re-review work
 - audit logs are local JSONL records and should be treated as sensitive operator data
 
-### Runtime containment already in draft
-Passport also has a real runtime consent and audit lane on supported surfaces:
+### Runtime containment
+Passport also has runtime consent and audit controls on supported surfaces:
 - `message_sending`
 - `message.send`
 - `sessions_send`
 
-That matters. It is the runtime enforcement Passport actually owns today, and it is not a claim about universal interception.
-
 ## What Agent Passport does not claim
 
-This draft does **not** honestly claim:
+Agent Passport does **not** claim:
 - universal pre-install interception
 - universal pre-exec interception
 - universal pre-network interception
@@ -138,15 +110,13 @@ This draft does **not** honestly claim:
 - complete containment of every malicious plugin or skill path
 - remote preinstall scanning of ClawHub content before OpenClaw fetches it
 
-The right current claim is narrower and stronger:
+Current scope:
 
 **Agent Passport helps detect and constrain poisoned skills and plugins on the paths it can actually see and control.**
 
 ## Scanner model
 
-The scanner is local, rule-based, and explainable on purpose.
-
-That is a feature, not a compromise. Operators should be able to see why something was flagged.
+The scanner is local, rule-based, and explainable. Operators should be able to see why something was flagged.
 
 ### Current high-signal categories
 - `remote-script-execution`
@@ -166,7 +136,7 @@ The scanner distinguishes artifact shape and explains findings differently for:
 - `hybrid`
 - `unknown`
 
-That means Passport can say more than “this looks bad.” It can explain why the signal matters for this kind of artifact.
+That lets Passport explain why a signal matters for this kind of artifact instead of just saying something looks bad.
 
 ### Example outcomes
 - clean plugin → `allow`
@@ -189,7 +159,7 @@ This is why drift matters so much in Passport. “We reviewed it once” is not 
 
 ## Plugin workflow
 
-Plugins are the most complete lifecycle in the draft right now.
+Plugins are the most complete lifecycle right now.
 
 ### Real plugin commands
 - `/passport install-plugin <local-path> [--link] [--pin] [--enable] [--dry-run]`
@@ -220,9 +190,9 @@ If the current source fingerprint no longer matches the fingerprint captured at 
 
 ## Skill workflow
 
-Skills are handled honestly. Not as fake plugin clones.
+Skills are handled as skills, not treated like plugin clones.
 
-OpenClaw skills are ClawHub slug-based, not local-path plugin installs. So Passport currently focuses on installed-state truth, review state, and drift-aware re-review.
+OpenClaw skills are ClawHub slug-based, not local-path plugin installs. Passport focuses on installed-state truth, review state, and drift-aware re-review.
 
 ### Real skill commands
 - `/passport skills`
@@ -260,16 +230,16 @@ On Telegram it also supports lightweight interaction:
 - review, trust, or block the top plugin or skill
 - return to the workspace view after inspection
 
-That gives Passport a real operator loop instead of a pile of disconnected commands.
+That gives operators one place to inspect and act instead of bouncing between unrelated commands.
 
 ## Example workflows
 
 ### 1. Clean plugin
-Goal: install a local plugin that scans cleanly and keep the workflow honest.
+Install a local plugin that scans cleanly.
 
 ```bash
-/passport scan ./fixtures/scanner/clean-plugin
-/passport install-plugin ./fixtures/scanner/clean-plugin --dry-run
+/passport scan /path/to/clean-plugin
+/passport install-plugin /path/to/clean-plugin --dry-run
 ```
 
 Expected shape:
@@ -283,11 +253,11 @@ Why this matters:
 - the install is still fingerprinted and recorded so trust has memory later
 
 ### 2. Suspicious skill
-Goal: inspect an installed or local skill that looks sketchy, review it, and avoid fake certainty.
+Inspect a skill that looks sketchy and review it before trusting it.
 
 ```bash
-/passport scan ./fixtures/scanner/suspicious-skill
-/passport review ./fixtures/scanner/suspicious-skill
+/passport scan /path/to/suspicious-skill
+/passport review /path/to/suspicious-skill
 ```
 
 Expected shape:
@@ -302,7 +272,7 @@ Why this matters:
 - Passport treats docs and setup instructions as part of the trust surface
 
 ### 3. Drift and re-review
-Goal: show that prior trust does not silently survive artifact change.
+Show that prior trust does not silently survive an artifact change.
 
 Typical flow:
 
@@ -337,47 +307,20 @@ Passport includes a proactive drift layer.
 - `/passport drift-sweep`
 - `/passport drift-alerts`
 
-### CLI
-```bash
-npm run drift:alerts
-npm run drift:sweep
-npm run drift:alerts:json
-node ./scripts/drift-alerts.mjs --mode alerts --format json
-```
-
-Exit codes:
-- `0` = success, no new alerts
-- `10` = success, new alerts detected
-- `1` = error
-
-Alerts-mode JSON includes:
-- `alert`
-- `newlyEntered`
-- `resolved`
-- `summary`
-- `nextCommand: "/passport workspace-state"`
-
-That makes Passport easy to wire into cron or shell automation without noisy repeated alerts.
+Use the in-product Passport commands above as the supported operator surface.
 
 ## Install and local development
 
 ### Local plugin path
-Install this draft from a local checkout with the real OpenClaw plugin command:
+Install from a local checkout with the standard OpenClaw plugin command:
 
 ```bash
-openclaw plugins install /path/to/agent-passport-plugin-v1 --link
+openclaw plugins install /path/to/agent-passport-plugin --link
 openclaw plugins enable agent-passport
 ```
 
 ### Local verification
-From the repo root:
-
-```bash
-npm run scan:regression
-npm run drift:alerts:json
-```
-
-Those helper scripts and regression fixtures live in the source repo for development and validation. They are not part of the published package tarball.
+From the repo root, use `npm pack --dry-run` to confirm the published surface is clean before release.
 
 ## Commands
 
@@ -465,88 +408,13 @@ If you are documenting or publishing Passport on ClawHub, this distinction matte
 - `agent_passport_drift_alerts`
 - `agent_passport_list_scan_reviews`
 
-## Scanner regression fixtures
-
-Regression fixtures live under `fixtures/scanner/`:
-- `clean-plugin`
-- `governance-risk-plugin`
-- `runtime-risk-plugin`
-- `docs-risk-plugin`
-- `suspicious-skill`
-
-Run the regression suite:
-
-```bash
-npm run scan:regression
-```
-
-Update snapshots:
-
-```bash
-npm run scan:regression:update
-```
-
-Run one case:
-
-```bash
-npm run scan:regression:case -- docs-risk-plugin
-```
-
-Machine-readable output:
-
-```bash
-npm run scan:regression:json
-node ./scripts/scanner-regression.mjs --format json
-```
-
-Compact human output:
-
-```bash
-npm run scan:regression:summary
-```
-
-Counts output:
-
-```bash
-npm run scan:regression:counts
-```
-
-CLI smoke coverage:
-
-```bash
-npm run scan:regression:cli
-```
-
-This is the cheap drift alarm for scanner semantics. If scanner behavior moves, these cases should fail before docs and demos quietly drift apart.
-
 ## Recommended posture
 
-### Consumer-safe default
 - default mode: `warn` or `audit`
-- control lane trusted or audit-only
-- scanner and explanation first
-- runtime containment as backup, not the headline
-
-### Enterprise-leaning default
-- scanner before trust or enable
-- authorize before install, enable, or update where supported
-- require re-review on meaningful drift
-- keep auditable approval state
-- use tighter runtime containment on supported non-control paths
-
-## Near-term roadmap
-
-1. keep improving docs and positioning around poisoned-package defense
-2. preserve safe defaults for control lanes
-3. continue hardening scanner semantics and report quality
-4. tighten plugin and skill re-review workflows
-5. add deeper provenance and publisher trust later
-6. only claim broader interception when real hooks exist
+- keep the control lane trusted or audit-only
+- put scanner output and explanation first
+- use runtime containment as a supported backstop, not the headline
 
 ## Bottom line
 
-Agent Passport is no longer just an outbound-comms gate.
-
-It is becoming a scanner-first trust layer for poisoned skills and plugins, with real review state, drift-aware re-review, honest install and update authorization where hooks exist, and runtime containment on the paths Passport can actually control.
-
-That is the right story. And now the code is finally close enough to the story that the README can say it without bullshit.
+Agent Passport is a scanner-first trust layer for poisoned skills and plugins, with review state, drift-aware re-review, install and update authorization where hooks exist, and runtime containment on the paths Passport can actually control.
