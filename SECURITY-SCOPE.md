@@ -24,6 +24,8 @@ Passport enforces consent checks on the hook surfaces it actually controls:
 - `message.send`
 - `sessions_send`
 
+These enforcement hooks register with explicit early priority so Passport's block/cancel decision runs deterministically before lower-priority handlers on the same surfaces.
+
 It also wraps explicit install, enable, update, review, trust, block, and drift workflows for local plugins and tracked workspace skills.
 
 ## What It Does Not Claim

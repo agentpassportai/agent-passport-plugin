@@ -83,6 +83,7 @@ These parts are already implemented.
 - single-item truth views for plugins and skills
 - combined `/passport workspace-state` view across plugins and skills
 - ranked `/passport workspace-audit` incident-response view with remediation targets
+- trust-tier and provenance summaries in the normal plugin, skill, and workspace state views
 - Telegram action buttons from the workspace view
 - proactive drift sweep and drift alerts
 - cron/shell-friendly alerts CLI
@@ -101,6 +102,8 @@ Passport also has runtime consent and audit controls on supported surfaces:
 - `message_sending`
 - `message.send`
 - `sessions_send`
+
+These hooks now register with explicit early priority so Passport's consent gate runs deterministically before lower-priority plugin handlers on the same surfaces.
 
 ## What Agent Passport does not claim
 

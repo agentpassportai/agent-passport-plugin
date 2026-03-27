@@ -14,6 +14,7 @@ import { getLatestPluginInstall, listPluginInstalls, markPluginEnabled, recordPl
 import { getLatestSkillReviewRecord, recordSkillReview } from "./skill-review-ledger.js";
 import { buildDriftAlerts, listPluginsNeedingRereview, sweepRereviewQueue } from "./rereview.js";
 import { inspectSkillArtifact } from "./skill-inspection.js";
+import { buildArtifactTrustSummary } from "./trust-summary.js";
 import { buildWorkspaceAudit, formatWorkspaceAudit, type WorkspaceAuditOptions } from "./workspace-audit.js";
 import {
   createConsentRequest,
@@ -64,6 +65,7 @@ type LoadedPluginConfig = {
 const GUARDED_SCOPES: GuardedScope[] = ["message_sending", "message.send", "sessions_send"];
 const TELEGRAM_NAMESPACE = "passport";
 const OPTIONAL_MUTATING_TOOL = { optional: true } as const;
+const EARLY_SECURITY_HOOK_PRIORITY = 100;
 
 function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPluginConfig {
   const auditConfig = raw?.audit && typeof raw.audit === "object"
@@ -594,6 +596,9 @@ function buildPluginStateReply(input: Awaited<ReturnType<typeof buildPluginState
     `- enabled at: ${input.latestInstall.enabledAt ?? "not recorded"}`,
     `- recorded review: ${input.latestInstall.reviewDecision ?? "none"}`,
     `- current review: ${input.currentReview ? decisionSummary(input.currentReview.decision) : "none recorded for current fingerprint"}`,
+    `- trust tier: ${input.trustSummary.tier}`,
+    `- trust reason: ${input.trustSummary.reason}`,
+    `- provenance: ${input.trustSummary.provenance}`,
     `- recorded fingerprint: ${input.drift.recordedFingerprint}`,
     `- current fingerprint: ${input.drift.currentFingerprint}`,
     `- drift changed: ${input.drift.changed ? "yes" : "no"}`,
@@ -647,6 +652,10 @@ export async function buildWorkspaceState() {
 function buildWorkspaceStateReply(input: Awaited<ReturnType<typeof buildWorkspaceState>>) {
   const pluginAttention = input.plugins.items.filter((item) => !item.ok || item.state === "rereview-required" || item.state === "blocked" || item.state === "unreviewed");
   const skillAttention = input.skills.items.filter((item) => !item.ok || item.state === "rereview-required" || item.state === "blocked" || item.state === "dangerous-unreviewed" || item.state === "needs-review" || item.state === "unreviewed");
+  const trustedPluginTierCount = input.plugins.items.filter((item) => item.ok && item.trustSummary.tier === "trusted").length;
+  const reviewRequiredPluginTierCount = input.plugins.items.filter((item) => item.ok && item.trustSummary.tier === "review-required").length;
+  const trustedSkillTierCount = input.skills.items.filter((item) => item.ok && item.trustSummary.tier === "trusted").length;
+  const reviewRequiredSkillTierCount = input.skills.items.filter((item) => item.ok && item.trustSummary.tier === "review-required").length;
 
   const text = [
     "Agent Passport workspace state:",
@@ -654,22 +663,24 @@ function buildWorkspaceStateReply(input: Awaited<ReturnType<typeof buildWorkspac
     `- plugins trusted: ${input.plugins.counts.trusted}`,
     `- plugins reviewed: ${input.plugins.counts.reviewed}`,
     `- plugins blocked: ${input.plugins.counts.blocked}`,
+    `- plugin trust tiers: trusted=${trustedPluginTierCount}, review-required=${reviewRequiredPluginTierCount}`,
     `- plugins needing attention: ${pluginAttention.length}`,
     `- skills tracked: ${input.skills.counts.total}`,
     `- skills trusted: ${input.skills.counts.trusted}`,
     `- skills reviewed: ${input.skills.counts.reviewed}`,
     `- skills blocked: ${input.skills.counts.blocked}`,
+    `- skill trust tiers: trusted=${trustedSkillTierCount}, review-required=${reviewRequiredSkillTierCount}`,
     `- skills needing attention: ${skillAttention.length}`,
     `- total re-review queue: ${input.attention.total}`,
     "",
     ...(pluginAttention.length ? [
       "Plugins needing attention:",
-      ...pluginAttention.slice(0, 10).map((item) => `- ${item.pluginId}: ${item.state}${item.ok ? ` (${item.reason})` : ""}`),
+      ...pluginAttention.slice(0, 10).map((item) => `- ${item.pluginId}: ${item.state}${item.ok ? ` [${item.trustSummary.tier}] (${item.reason})` : ""}`),
       ""
     ] : []),
     ...(skillAttention.length ? [
       "Skills needing attention:",
-      ...skillAttention.slice(0, 10).map((item) => `- ${item.slug}: ${item.state}${item.installedVersion ? ` (${item.installedVersion})` : ""}`),
+      ...skillAttention.slice(0, 10).map((item) => `- ${item.slug}: ${item.state}${item.installedVersion ? ` (${item.installedVersion})` : ""}${item.ok ? ` [${item.trustSummary.tier}]` : ""}`),
       ""
     ] : []),
     "Recommended next steps:",
@@ -1366,6 +1377,16 @@ export async function buildSkillState(input: { slug: string }) {
     const recommendedActions: string[] = [
       `/passport scan ${skillDir}`
     ];
+    const trustSummary = buildArtifactTrustSummary({
+      artifactKind: "skill",
+      reviewDecision: scanReview?.decision ?? null,
+      recommendationAction: report.packageRecommendation.action,
+      verdict: report.verdict,
+      driftChanged: drift?.changed ?? false,
+      fingerprint: report.fingerprint,
+      registry: origin?.registry ?? null,
+      sourcePath: skillDir
+    });
 
     if (drift?.changed && scanReview?.decision !== "trust") {
       state = "rereview-required";
@@ -1407,6 +1428,7 @@ export async function buildSkillState(input: { slug: string }) {
       verdict: report.verdict,
       recommendation: report.packageRecommendation.action,
       currentReview: scanReview ?? null,
+      trustSummary,
       baseline,
       drift,
       recommendedActions
@@ -1426,6 +1448,16 @@ export async function buildSkillState(input: { slug: string }) {
       verdict: null,
       recommendation: null,
       currentReview: null,
+      trustSummary: buildArtifactTrustSummary({
+        artifactKind: "skill",
+        reviewDecision: null,
+        recommendationAction: null,
+        verdict: null,
+        driftChanged: false,
+        fingerprint: null,
+        registry: origin?.registry ?? null,
+        sourcePath: skillDir
+      }),
       baseline,
       drift: null,
       recommendedActions: [],
@@ -1457,6 +1489,9 @@ function buildSkillStateReply(input: Awaited<ReturnType<typeof buildSkillState>>
     `- fingerprint: ${input.fingerprint}`,
     `- verdict/recommendation: ${input.verdict} / ${input.recommendation}`,
     `- current review: ${input.currentReview ? decisionSummary(input.currentReview.decision) : "none recorded for current fingerprint"}`,
+    `- trust tier: ${input.trustSummary.tier}`,
+    `- trust reason: ${input.trustSummary.reason}`,
+    `- provenance: ${input.trustSummary.provenance}`,
     ...(input.baseline ? [
       `- last skill review fingerprint: ${input.baseline.fingerprint}`,
       `- last skill review decision: ${decisionSummary(input.baseline.decision)}`,
@@ -1591,6 +1626,15 @@ export async function buildPluginState(input: { pluginId: string }) {
       installCount: 0,
       drift: null,
       currentReview: null,
+      trustSummary: buildArtifactTrustSummary({
+        artifactKind: "plugin",
+        reviewDecision: null,
+        recommendationAction: null,
+        verdict: null,
+        driftChanged: false,
+        fingerprint: null,
+        sourcePath: null
+      }),
       state: null,
       recommendedActions: [] as string[]
     };
@@ -1606,6 +1650,15 @@ export async function buildPluginState(input: { pluginId: string }) {
       installCount: installs.length,
       drift: null,
       currentReview: null,
+      trustSummary: buildArtifactTrustSummary({
+        artifactKind: "plugin",
+        reviewDecision: null,
+        recommendationAction: null,
+        verdict: null,
+        driftChanged: false,
+        fingerprint: null,
+        sourcePath: null
+      }),
       state: null,
       recommendedActions: [] as string[]
     };
@@ -1615,6 +1668,15 @@ export async function buildPluginState(input: { pluginId: string }) {
   const currentReview = driftCheck.currentReview;
   const drift = driftCheck.drift!;
   const sourcePath = latestInstall.sourcePath;
+  const trustSummary = buildArtifactTrustSummary({
+    artifactKind: "plugin",
+    reviewDecision: currentReview?.decision ?? null,
+    recommendationAction: drift.currentRecommendation,
+    verdict: drift.currentVerdict,
+    driftChanged: drift.changed,
+    fingerprint: drift.currentFingerprint,
+    sourcePath
+  });
   const recommendedActions: string[] = [];
   let state = "healthy";
 
@@ -1657,6 +1719,7 @@ export async function buildPluginState(input: { pluginId: string }) {
     installCount: installs.length,
     drift,
     currentReview,
+    trustSummary,
     state,
     recommendedActions
   };
@@ -1804,7 +1867,7 @@ export default definePluginEntry({
       }
 
       return result;
-    });
+    }, { priority: EARLY_SECURITY_HOOK_PRIORITY });
 
     api.on("before_tool_call", async (event, ctx) => {
       const pluginCfg = currentConfig();
@@ -1882,7 +1945,7 @@ export default definePluginEntry({
           auditRecord: { kind: "before_tool_call", toolName, event, context: ctx }
         });
       }
-    });
+    }, { priority: EARLY_SECURITY_HOOK_PRIORITY });
 
     api.registerCommand({
       name: "passport",
@@ -2167,7 +2230,9 @@ export default definePluginEntry({
                 `  state: ${item.state}`,
                 `  version: ${item.installedVersion ?? "unknown"}`,
                 `  verdict/recommendation: ${item.verdict ?? "unknown"} / ${item.recommendation ?? "unknown"}`,
-                `  review: ${item.currentReview ? decisionSummary(item.currentReview.decision) : "none"}`
+                `  review: ${item.currentReview ? decisionSummary(item.currentReview.decision) : "none"}`,
+                `  trust tier: ${item.trustSummary.tier}`,
+                `  provenance: ${item.trustSummary.provenance}`
               ].join("\n"))
             ].join("\n\n")
           };
