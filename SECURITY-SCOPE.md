@@ -26,6 +26,8 @@ Passport enforces consent checks on the hook surfaces it actually controls:
 
 These enforcement hooks register with explicit early priority so Passport's block/cancel decision runs deterministically before lower-priority handlers on the same surfaces.
 
+Passport also audits canonical inbound routing metadata through `before_dispatch` on OpenClaw `2026.3.24+`. That inbound hook is audit-first in Passport today; it classifies higher-risk group or prompt-injection-shaped traffic but does not claim inbound blocking or universal prompt-injection prevention.
+
 It also wraps explicit install, enable, update, review, trust, block, and drift workflows for local plugins and tracked workspace skills.
 
 ## What It Does Not Claim

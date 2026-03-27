@@ -99,11 +99,14 @@ Passport stores its review and operating state locally in the workspace unless c
 
 ### Runtime containment
 Passport also has runtime consent and audit controls on supported surfaces:
+- `before_dispatch` for canonical inbound audit and risk classification on OpenClaw `2026.3.24+`
 - `message_sending`
 - `message.send`
 - `sessions_send`
 
-These hooks now register with explicit early priority so Passport's consent gate runs deterministically before lower-priority plugin handlers on the same surfaces.
+`before_dispatch` is audit-first in Passport today. It records canonical inbound routing metadata and flags higher-risk group or prompt-injection-shaped traffic without claiming inbound enforcement.
+
+These hooks now register with explicit early priority so Passport's consent gate and inbound audit run deterministically before lower-priority plugin handlers on the same surfaces.
 
 ## What Agent Passport does not claim
 

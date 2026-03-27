@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "@sinclair/typebox";
 import { evaluateAction } from "./policy/engine.js";
+import { evaluateInboundDispatch } from "./policy/inbound-dispatch.js";
 import { evaluateOutboundCommunication } from "./policy/outbound-comms.js";
 import { appendAuditRecord, configureAuditRuntime } from "./audit.js";
 import { scanPath } from "./scanner/index.js";
@@ -241,6 +242,7 @@ async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
       "Agent Passport status:",
       `- default mode: ${pluginCfg.mode}`,
       ...pathLines,
+      "- inbound dispatch audit: enabled via before_dispatch",
       `- active grants: ${grants.length}`,
       `- pending requests: ${pendingRequests.length}`,
       `- reviewed artifacts: ${reviews.length}`,
@@ -1802,6 +1804,30 @@ export default definePluginEntry({
 
     currentConfig();
 
+    api.on("before_dispatch", async (event, ctx) => {
+      const decision = evaluateInboundDispatch({
+        channel: event.channel ?? ctx.channelId,
+        sessionKey: event.sessionKey ?? ctx.sessionKey,
+        senderId: event.senderId ?? ctx.senderId,
+        isGroup: event.isGroup,
+        content: event.content,
+        body: event.body
+      });
+
+      await appendAuditRecord({
+        kind: "before_dispatch",
+        event,
+        context: ctx,
+        decision
+      });
+
+      if (decision.severity === "high") {
+        api.logger.warn?.(`agent-passport: inbound dispatch flagged ${decision.category} (${decision.matchedRule})`);
+      } else if (decision.severity === "medium") {
+        api.logger.info?.(`agent-passport: inbound dispatch audit raised ${decision.category} (${decision.matchedRule})`);
+      }
+    }, { priority: EARLY_SECURITY_HOOK_PRIORITY });
+
     api.on("message_sending", async (event, ctx) => {
       const pluginCfg = currentConfig();
       const target = normalizeTarget(event.to);
@@ -2809,6 +2835,7 @@ export default definePluginEntry({
                 activeConsentCount: grants.length,
                 pendingConsentRequestCount: pendingRequests.length,
                 guardedPaths: ["message_sending", "message(action=send)", "sessions_send"],
+                auditedInboundPaths: ["before_dispatch"],
                 reviewedArtifactCount: (await listScanReviews()).length,
                 recordedPluginInstallCount: (await listPluginInstalls()).length,
                 trackedSkillCount: (await listSkillStates()).length,
