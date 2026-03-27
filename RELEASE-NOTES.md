@@ -1,5 +1,5 @@
-Agent Passport 0.1.3 adds the first explicit incident-response and skill-quarantine operator surfaces on top of the scanner-first trust model.
+Agent Passport 0.1.4 promotes trust-tier and provenance information into the normal operator views and makes the runtime consent gate deterministic.
 
-This release adds a ranked workspace incident audit for tracked plugins and skills, local-first skill artifact inspection with quarantine staging and trust-tier reporting, and explicit OpenClaw CLI entrypoints for both flows. The normal `/passport` command surface and the plugin docs were updated to reflect those operator paths, and the public security scope now documents the quarantine review area as part of Passport's local state.
+This release adds shared trust-summary logic for plugins and skills, exposes trust tier and provenance details in the standard plugin, skill, and workspace state outputs, and adds regression coverage for those summaries. It also registers the `message_sending` and `before_tool_call` enforcement hooks with explicit early priority so Passport's consent gate does not rely on default plugin ordering.
 
-The release still keeps the trust boundary honest: skill inspection is local-first, not a claim of remote marketplace interception, and the new workspace audit is read-only reporting that feeds the existing review and trust workflows rather than bypassing them.
+The scope is still intentionally narrow and honest: the release improves visibility and determinism on the surfaces Passport already controls, without claiming broader interception or remote marketplace preinstall scanning.
