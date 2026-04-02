@@ -2,6 +2,9 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import type { ReplyPayload } from "openclaw/plugin-sdk";
+import { DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS } from "openclaw/plugin-sdk/approval-runtime";
+import { createOperatorApprovalsGatewayClient } from "openclaw/plugin-sdk/gateway-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "@sinclair/typebox";
 import { evaluateAction } from "./policy/engine.js";
@@ -63,10 +66,21 @@ type LoadedPluginConfig = {
   };
 };
 
+type NativeApprovalSeverity = "info" | "warning" | "critical";
+type NativeApprovalResolution = "allow-once" | "allow-always" | "deny" | "timeout" | "cancelled";
+type NativeApprovalGatewayClient = Awaited<ReturnType<typeof createOperatorApprovalsGatewayClient>>;
+type NativeApprovalGatewayResult = {
+  approvalId?: string;
+  resolution: NativeApprovalResolution;
+  routeAvailable: boolean;
+  error?: string;
+};
+
 const GUARDED_SCOPES: GuardedScope[] = ["message_sending", "message.send", "sessions_send"];
 const TELEGRAM_NAMESPACE = "passport";
 const OPTIONAL_MUTATING_TOOL = { optional: true } as const;
 const EARLY_SECURITY_HOOK_PRIORITY = 100;
+const NATIVE_PLUGIN_APPROVAL_COMMAND_HINT = "Reply with: /approve <id> allow-once|allow-always|deny";
 
 function getPluginConfig(raw: Record<string, unknown> | undefined): LoadedPluginConfig {
   const auditConfig = raw?.audit && typeof raw.audit === "object"
@@ -174,6 +188,392 @@ function buildDecisionText(prefix: string, matchedRule: string, mode: string, re
   return `${prefix} (${matchedRule}, mode=${mode}).${requestSuffix}`;
 }
 
+function approvalSeverityForDecision(decision: ReturnType<typeof evaluateOutboundCommunication>): NativeApprovalSeverity {
+  if (decision.outcome === "deny") return "critical";
+  if (decision.severity === "high" || decision.severity === "medium") return "warning";
+  return "info";
+}
+
+function buildNativeApprovalDescription(input: {
+  scope: GuardedScope;
+  target: string;
+  decision: ReturnType<typeof evaluateOutboundCommunication>;
+  consentTtlMinutes: number;
+}) {
+  const { scope, target, decision, consentTtlMinutes } = input;
+  const actionLabel = scope === "message_sending" ? `an outbound message to ${target}` : `${scope} to ${target}`;
+  const allowOnceLabel = scope === "message_sending"
+    ? "Allow once permits only this outbound message."
+    : "Allow once permits only this tool call.";
+  return [
+    `Agent Passport paused ${actionLabel}.`,
+    decision.reason,
+    allowOnceLabel,
+    `Allow always creates a Passport consent grant for ${consentTtlMinutes} minute${consentTtlMinutes === 1 ? "" : "s"}.`
+  ].join("\n");
+}
+
+function buildNativeApprovalNote(resolution: NativeApprovalResolution, consentTtlMinutes: number) {
+  return resolution === "allow-once"
+    ? "Approved once via native plugin approval."
+    : resolution === "allow-always"
+      ? `Approved via native plugin approval; Passport TTL=${consentTtlMinutes}m.`
+      : `Denied via native plugin approval (${resolution}).`;
+}
+
+function normalizeNativeApprovalResolution(value: unknown): NativeApprovalResolution {
+  switch (value) {
+    case "allow-once":
+    case "allow-always":
+    case "deny":
+    case "timeout":
+    case "cancelled":
+      return value;
+    default:
+      return "timeout";
+  }
+}
+
+export function isForwardedNativePluginApprovalMessage(content: string | null | undefined) {
+  const text = String(content ?? "").trim();
+  if (!text) return false;
+
+  if (
+    text.includes("Plugin approval required")
+    && text.includes("\nTitle: ")
+    && text.includes("\nID: ")
+    && text.includes(`\n${NATIVE_PLUGIN_APPROVAL_COMMAND_HINT}`)
+  ) {
+    return true;
+  }
+
+  if (/^✅ Plugin approval (allowed once|allowed always|denied)\./.test(text) && text.includes(" ID: ")) {
+    return true;
+  }
+
+  return /^⏱️ Plugin approval expired\. ID: /.test(text);
+}
+
+async function persistNativeApprovalResolution(input: {
+  requestId: string;
+  resolution: NativeApprovalResolution;
+  decision: ReturnType<typeof evaluateOutboundCommunication>;
+  scope: GuardedScope;
+  pluginCfg: LoadedPluginConfig;
+  auditRecord: Record<string, unknown>;
+  approvalMode: "native-requireApproval" | "native-gateway-plugin-approval";
+  gatewayApprovalId?: string;
+}) {
+  try {
+    const result = await reviewConsentRequest({
+      requestId: input.requestId,
+      decision: input.resolution === "allow-once" || input.resolution === "allow-always" ? "approved" : "denied",
+      grantMode: input.resolution === "allow-always" ? "ttl" : "none",
+      ttlMinutes: input.pluginCfg.consentTtlMinutes,
+      note: buildNativeApprovalNote(input.resolution, input.pluginCfg.consentTtlMinutes)
+    });
+
+    await appendAuditRecord({
+      ...input.auditRecord,
+      decision: input.decision,
+      scope: input.scope,
+      mode: "enforce",
+      globalMode: input.pluginCfg.mode,
+      effectiveMode: "enforce",
+      consentRequestId: input.requestId,
+      approvalMode: input.approvalMode,
+      approvalState: "resolved",
+      approvalResolution: input.resolution,
+      gatewayApprovalId: input.gatewayApprovalId,
+      reviewResult: result
+    });
+
+    return result;
+  } catch (error) {
+    await appendAuditRecord({
+      ...input.auditRecord,
+      decision: input.decision,
+      scope: input.scope,
+      mode: "enforce",
+      globalMode: input.pluginCfg.mode,
+      effectiveMode: "enforce",
+      consentRequestId: input.requestId,
+      approvalMode: input.approvalMode,
+      approvalState: "resolution-error",
+      approvalResolution: input.resolution,
+      gatewayApprovalId: input.gatewayApprovalId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return null;
+  }
+}
+
+function getMessageSendingTurnSource(input: {
+  event: { metadata?: Record<string, unknown> };
+  ctx: { channelId: string; accountId?: string; conversationId?: string };
+}) {
+  const metadata = input.event.metadata && typeof input.event.metadata === "object"
+    ? input.event.metadata
+    : {};
+  const threadId = typeof metadata.threadId === "string" || typeof metadata.threadId === "number"
+    ? metadata.threadId
+    : undefined;
+
+  return {
+    turnSourceChannel: input.ctx.channelId,
+    turnSourceTo: input.ctx.conversationId,
+    turnSourceAccountId: input.ctx.accountId,
+    turnSourceThreadId: threadId
+  };
+}
+
+export async function requestNativePluginApprovalDecision(input: {
+  config: Parameters<typeof createOperatorApprovalsGatewayClient>[0]["config"];
+  pluginId: string;
+  title: string;
+  description: string;
+  severity: NativeApprovalSeverity;
+  turnSourceChannel?: string;
+  turnSourceTo?: string;
+  turnSourceAccountId?: string;
+  turnSourceThreadId?: string | number;
+}, deps?: {
+  createGatewayClient?: typeof createOperatorApprovalsGatewayClient;
+}) {
+  const createGatewayClient = deps?.createGatewayClient ?? createOperatorApprovalsGatewayClient;
+  let client: NativeApprovalGatewayClient | null = null;
+
+  try {
+    client = await createGatewayClient({
+      config: input.config,
+      clientDisplayName: "Agent Passport approvals"
+    });
+    client.start();
+
+    const requestResult = await client.request<{
+      id?: string;
+      decision?: NativeApprovalResolution | null;
+    }>("plugin.approval.request", {
+      pluginId: input.pluginId,
+      title: input.title,
+      description: input.description,
+      severity: input.severity,
+      timeoutMs: DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
+      twoPhase: true,
+      ...(input.turnSourceChannel ? { turnSourceChannel: input.turnSourceChannel } : {}),
+      ...(input.turnSourceTo ? { turnSourceTo: input.turnSourceTo } : {}),
+      ...(input.turnSourceAccountId ? { turnSourceAccountId: input.turnSourceAccountId } : {}),
+      ...(input.turnSourceThreadId !== undefined ? { turnSourceThreadId: input.turnSourceThreadId } : {})
+    }, {
+      expectFinal: false,
+      timeoutMs: DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS + 10_000
+    });
+
+    const approvalId = typeof requestResult?.id === "string" ? requestResult.id : undefined;
+    if (!approvalId) {
+      return {
+        resolution: "cancelled",
+        routeAvailable: false,
+        error: "gateway did not return a plugin approval id"
+      } satisfies NativeApprovalGatewayResult;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(requestResult ?? {}, "decision")) {
+      if (requestResult?.decision === null) {
+        return {
+          approvalId,
+          resolution: "cancelled",
+          routeAvailable: false
+        } satisfies NativeApprovalGatewayResult;
+      }
+
+      return {
+        approvalId,
+        resolution: normalizeNativeApprovalResolution(requestResult?.decision),
+        routeAvailable: true
+      } satisfies NativeApprovalGatewayResult;
+    }
+
+    const waitResult = await client.request<{ decision?: NativeApprovalResolution }>("plugin.approval.waitDecision", { id: approvalId }, {
+      timeoutMs: DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS + 10_000
+    });
+
+    return {
+      approvalId,
+      resolution: normalizeNativeApprovalResolution(waitResult?.decision),
+      routeAvailable: true
+    } satisfies NativeApprovalGatewayResult;
+  } catch (error) {
+    return {
+      resolution: "cancelled",
+      routeAvailable: false,
+      error: error instanceof Error ? error.message : String(error)
+    } satisfies NativeApprovalGatewayResult;
+  } finally {
+    await client?.stopAndWait({ timeoutMs: 1_000 }).catch(() => void 0);
+  }
+}
+
+export async function handleNativeMessageSendingApproval(input: {
+  config: Parameters<typeof createOperatorApprovalsGatewayClient>[0]["config"];
+  pluginId: string;
+  logger: {
+    info?: (message: string) => void;
+    warn: (message: string) => void;
+  };
+  event: {
+    to: string;
+    content: string;
+    metadata?: Record<string, unknown>;
+  };
+  ctx: {
+    channelId: string;
+    accountId?: string;
+    conversationId?: string;
+  };
+  target: string;
+  decision: ReturnType<typeof evaluateOutboundCommunication>;
+  pluginCfg: LoadedPluginConfig;
+  auditRecord: Record<string, unknown>;
+}, deps?: {
+  createGatewayClient?: typeof createOperatorApprovalsGatewayClient;
+}) {
+  const request = await createConsentRequest({
+    target: input.target,
+    action: "message_sending",
+    reason: input.decision.reason
+  });
+
+  await appendAuditRecord({
+    ...input.auditRecord,
+    decision: input.decision,
+    scope: "message_sending",
+    mode: "enforce",
+    globalMode: input.pluginCfg.mode,
+    effectiveMode: "enforce",
+    consentRequestId: request.id,
+    approvalMode: "native-gateway-plugin-approval",
+    approvalState: "requested"
+  });
+
+  const gatewayResult = await requestNativePluginApprovalDecision({
+    config: input.config,
+    pluginId: input.pluginId,
+    title: "Agent Passport approval required",
+    description: buildNativeApprovalDescription({
+      scope: "message_sending",
+      target: input.target,
+      decision: input.decision,
+      consentTtlMinutes: input.pluginCfg.consentTtlMinutes
+    }),
+    severity: approvalSeverityForDecision(input.decision),
+    ...getMessageSendingTurnSource({
+      event: input.event,
+      ctx: input.ctx
+    })
+  }, deps);
+
+  if (!gatewayResult.routeAvailable) {
+    await appendAuditRecord({
+      ...input.auditRecord,
+      decision: input.decision,
+      scope: "message_sending",
+      mode: "enforce",
+      globalMode: input.pluginCfg.mode,
+      effectiveMode: "enforce",
+      consentRequestId: request.id,
+      approvalMode: "native-gateway-plugin-approval",
+      approvalState: "manual-fallback-pending",
+      approvalResolution: gatewayResult.resolution,
+      gatewayApprovalId: gatewayResult.approvalId,
+      error: gatewayResult.error
+    });
+
+    const errorSuffix = gatewayResult.error ? ` (${gatewayResult.error})` : "";
+    input.logger.warn(
+      `agent-passport: native approval routing unavailable for ${input.target}; request ${request.id} remains pending for manual /passport approve${errorSuffix}`
+    );
+
+    return {
+      allowed: false,
+      requestId: request.id,
+      gatewayApprovalId: gatewayResult.approvalId,
+      resolution: gatewayResult.resolution,
+      routeAvailable: false
+    };
+  }
+
+  await persistNativeApprovalResolution({
+    requestId: request.id,
+    resolution: gatewayResult.resolution,
+    decision: input.decision,
+    scope: "message_sending",
+    pluginCfg: input.pluginCfg,
+    auditRecord: input.auditRecord,
+    approvalMode: "native-gateway-plugin-approval",
+    gatewayApprovalId: gatewayResult.approvalId
+  });
+
+  return {
+    allowed: gatewayResult.resolution === "allow-once" || gatewayResult.resolution === "allow-always",
+    requestId: request.id,
+    gatewayApprovalId: gatewayResult.approvalId,
+    resolution: gatewayResult.resolution,
+    routeAvailable: true
+  };
+}
+
+export async function buildNativeToolApprovalRequirement(input: {
+  scope: Exclude<GuardedScope, "message_sending">;
+  target: string;
+  decision: ReturnType<typeof evaluateOutboundCommunication>;
+  pluginCfg: LoadedPluginConfig;
+  auditRecord: Record<string, unknown>;
+}) {
+  const request = await createConsentRequest({
+    target: input.target,
+    action: input.scope,
+    reason: input.decision.reason
+  });
+
+  await appendAuditRecord({
+    ...input.auditRecord,
+    decision: input.decision,
+    scope: input.scope,
+    mode: "enforce",
+    globalMode: input.pluginCfg.mode,
+    effectiveMode: "enforce",
+    consentRequestId: request.id,
+    approvalMode: "native-requireApproval",
+    approvalState: "requested"
+  });
+
+  return {
+    requireApproval: {
+      title: "Agent Passport approval required",
+      description: buildNativeApprovalDescription({
+        scope: input.scope,
+        target: input.target,
+        decision: input.decision,
+        consentTtlMinutes: input.pluginCfg.consentTtlMinutes
+      }),
+      severity: approvalSeverityForDecision(input.decision),
+      timeoutBehavior: "deny" as const,
+      onResolution: async (resolution: NativeApprovalResolution) => {
+        await persistNativeApprovalResolution({
+          requestId: request.id,
+          resolution,
+          decision: input.decision,
+          scope: input.scope,
+          pluginCfg: input.pluginCfg,
+          auditRecord: input.auditRecord,
+          approvalMode: "native-requireApproval"
+        });
+      }
+    }
+  };
+}
+
 function summarizeRequest(request: PassportConsentRequest) {
   return [
     `- ${request.id}`,
@@ -209,7 +609,88 @@ function parseInteractivePayload(payload: string | undefined) {
   return { action, requestId, target };
 }
 
-async function buildRequestsReply(status: PassportConsentRequest["status"] | "all" = "pending") {
+function jsonToolResult<TDetails>(details: TDetails) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(details, null, 2) }],
+    details
+  };
+}
+
+type PluginApprovalForwardingSummary = {
+  status: "disabled" | "configured" | "misconfigured";
+  enabled: boolean;
+  mode: "session" | "targets" | "both";
+  usesSessionRoute: boolean;
+  explicitTargetCount: number;
+  agentFilterCount: number;
+  sessionFilterCount: number;
+  reason: string;
+};
+
+export function summarizePluginApprovalForwardingConfig(config: Parameters<typeof createOperatorApprovalsGatewayClient>[0]["config"]): PluginApprovalForwardingSummary {
+  const pluginApprovals = config.approvals?.plugin;
+  const enabled = pluginApprovals?.enabled === true;
+  const mode = pluginApprovals?.mode === "targets" || pluginApprovals?.mode === "both"
+    ? pluginApprovals.mode
+    : "session";
+  const usesSessionRoute = mode === "session" || mode === "both";
+  const explicitTargetCount = Array.isArray(pluginApprovals?.targets)
+    ? pluginApprovals.targets.filter(
+        (target): target is { channel: string; to: string } =>
+          Boolean(target)
+          && typeof target === "object"
+          && typeof target.channel === "string"
+          && typeof target.to === "string"
+      ).length
+    : 0;
+  const agentFilterCount = Array.isArray(pluginApprovals?.agentFilter)
+    ? pluginApprovals.agentFilter.filter((value): value is string => typeof value === "string" && value.trim().length > 0).length
+    : 0;
+  const sessionFilterCount = Array.isArray(pluginApprovals?.sessionFilter)
+    ? pluginApprovals.sessionFilter.filter((value): value is string => typeof value === "string" && value.trim().length > 0).length
+    : 0;
+
+  if (!enabled) {
+    return {
+      status: "disabled",
+      enabled,
+      mode,
+      usesSessionRoute,
+      explicitTargetCount,
+      agentFilterCount,
+      sessionFilterCount,
+      reason: "approvals.plugin.enabled is false"
+    };
+  }
+
+  if (!usesSessionRoute && explicitTargetCount === 0) {
+    return {
+      status: "misconfigured",
+      enabled,
+      mode,
+      usesSessionRoute,
+      explicitTargetCount,
+      agentFilterCount,
+      sessionFilterCount,
+      reason: "approvals.plugin.mode=targets requires at least one approvals.plugin.targets entry"
+    };
+  }
+
+  return {
+    status: "configured",
+    enabled,
+    mode,
+    usesSessionRoute,
+    explicitTargetCount,
+    agentFilterCount,
+    sessionFilterCount,
+    reason: usesSessionRoute
+      ? "origin-session forwarding is enabled"
+      : `${explicitTargetCount} explicit forwarding target${explicitTargetCount === 1 ? "" : "s"} configured`
+  };
+}
+
+async function buildRequestsReply(status: PassportConsentRequest["status"] | "all" = "pending"): Promise<ReplyPayload> {
   const requests = await listConsentRequests({ status });
   if (!requests.length) {
     return {
@@ -228,7 +709,10 @@ async function buildRequestsReply(status: PassportConsentRequest["status"] | "al
   };
 }
 
-async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
+async function buildStatusReply(
+  pluginCfg: LoadedPluginConfig,
+  runtimeConfig: Parameters<typeof createOperatorApprovalsGatewayClient>[0]["config"]
+): Promise<ReplyPayload> {
   const grants = await listConsents();
   const pendingRequests = await listConsentRequests({ status: "pending" });
   const reviews = await listScanReviews();
@@ -236,6 +720,7 @@ async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
   const rereviewQueue = await listPluginsNeedingRereview();
   const skillRereviewQueue = await listSkillsNeedingRereview();
   const skills = await listSkillStates();
+  const pluginApprovalForwarding = summarizePluginApprovalForwardingConfig(runtimeConfig);
   const pathLines = GUARDED_SCOPES.map((scope) => `- ${scope}: ${getModeForScope(scope, pluginCfg)}`);
   return {
     text: [
@@ -243,6 +728,12 @@ async function buildStatusReply(pluginCfg: LoadedPluginConfig) {
       `- default mode: ${pluginCfg.mode}`,
       ...pathLines,
       "- inbound dispatch audit: enabled via before_dispatch",
+      `- plugin approval forwarding: ${pluginApprovalForwarding.status}`,
+      `- plugin approval forwarding mode: ${pluginApprovalForwarding.mode}`,
+      `- plugin approval session route: ${pluginApprovalForwarding.usesSessionRoute ? "yes" : "no"}`,
+      `- plugin approval explicit targets: ${pluginApprovalForwarding.explicitTargetCount}`,
+      `- plugin approval filters: agent=${pluginApprovalForwarding.agentFilterCount}, session=${pluginApprovalForwarding.sessionFilterCount}`,
+      `- plugin approval forwarding note: ${pluginApprovalForwarding.reason}`,
       `- active grants: ${grants.length}`,
       `- pending requests: ${pendingRequests.length}`,
       `- reviewed artifacts: ${reviews.length}`,
@@ -1829,6 +2320,10 @@ export default definePluginEntry({
     }, { priority: EARLY_SECURITY_HOOK_PRIORITY });
 
     api.on("message_sending", async (event, ctx) => {
+      if (isForwardedNativePluginApprovalMessage(event.content)) {
+        return;
+      }
+
       const pluginCfg = currentConfig();
       const target = normalizeTarget(event.to);
       const trustedMatch = getTrustedMatch(target, "message_sending", pluginCfg);
@@ -1873,6 +2368,32 @@ export default definePluginEntry({
         target
       });
 
+      if (getModeForScope("message_sending", pluginCfg) === "enforce" && (decision.outcome === "deny" || decision.outcome === "require_consent")) {
+        const approvalResult = await handleNativeMessageSendingApproval({
+          config: api.config,
+          pluginId: api.id,
+          logger: api.logger,
+          event,
+          ctx,
+          target,
+          decision,
+          pluginCfg,
+          auditRecord: {
+            kind: "message_sending",
+            channelId: ctx.channelId,
+            conversationId: ctx.conversationId,
+            event
+          }
+        });
+
+        if (!approvalResult.allowed) {
+          api.logger.info?.(`agent-passport: cancelled outbound send to ${event.to} via native message_sending approval (${approvalResult.resolution})`);
+          return { cancel: true };
+        }
+
+        return;
+      }
+
       const result = await handleConsentRequired({
         api,
         scope: "message_sending",
@@ -1886,11 +2407,6 @@ export default definePluginEntry({
           event
         }
       });
-
-      if (getModeForScope("message_sending", pluginCfg) === "enforce" && (decision.outcome === "deny" || decision.outcome === "require_consent")) {
-        api.logger.info?.(`agent-passport: cancelled outbound send to ${event.to} via message_sending hook (${decision.matchedRule})`);
-        return { cancel: true };
-      }
 
       return result;
     }, { priority: EARLY_SECURITY_HOOK_PRIORITY });
@@ -1925,6 +2441,16 @@ export default definePluginEntry({
           target,
           content: String(params.message ?? "")
         });
+
+        if (getModeForScope("message.send", pluginCfg) === "enforce" && (decision.outcome === "deny" || decision.outcome === "require_consent")) {
+          return buildNativeToolApprovalRequirement({
+            scope: "message.send",
+            target,
+            decision,
+            pluginCfg,
+            auditRecord: { kind: "before_tool_call", toolName, event, context: ctx }
+          });
+        }
 
         return handleConsentRequired({
           api,
@@ -1962,6 +2488,16 @@ export default definePluginEntry({
           content: String(params.message ?? "")
         });
 
+        if (getModeForScope("sessions_send", pluginCfg) === "enforce" && (decision.outcome === "deny" || decision.outcome === "require_consent")) {
+          return buildNativeToolApprovalRequirement({
+            scope: "sessions_send",
+            target,
+            decision,
+            pluginCfg,
+            auditRecord: { kind: "before_tool_call", toolName, event, context: ctx }
+          });
+        }
+
         return handleConsentRequired({
           api,
           scope: "sessions_send",
@@ -1983,7 +2519,7 @@ export default definePluginEntry({
         const action = (tokens[0] ?? "status").toLowerCase();
 
         if (action === "status") {
-          return buildStatusReply(pluginCfg);
+          return buildStatusReply(pluginCfg, api.config);
         }
 
         if (action === "requests") {
@@ -2748,7 +3284,7 @@ export default definePluginEntry({
         }
 
         if (action === "status") {
-          const reply = await buildStatusReply(pluginCfg);
+          const reply = await buildStatusReply(pluginCfg, api.config);
           await ctx.respond.editMessage({
             text: reply.text ?? "Agent Passport status unavailable.",
             buttons: reply.interactive?.blocks.flatMap((block) => block.type === "buttons"
@@ -2815,17 +3351,14 @@ export default definePluginEntry({
 
     api.registerTool({
       name: "agent_passport_status",
+      label: "agent_passport_status",
       description: "Show Agent Passport mode and current policy defaults",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const pluginCfg = currentConfig();
         const grants = await listConsents();
         const pendingRequests = await listConsentRequests({ status: "pending" });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
+        return jsonToolResult({
                 loaded: true,
                 mode: pluginCfg.mode,
                 pathModes: pluginCfg.pathModes,
@@ -2842,15 +3375,13 @@ export default definePluginEntry({
                 pluginRereviewQueueCount: (await listPluginsNeedingRereview()).length,
                 skillRereviewQueueCount: (await listSkillsNeedingRereview()).length,
                 rereviewQueueCount: (await listPluginsNeedingRereview()).length + (await listSkillsNeedingRereview()).length
-              }, null, 2)
-            }
-          ]
-        };
+              });
       }
     });
 
     api.registerTool({
       name: "agent_passport_scan_path",
+      label: "agent_passport_scan_path",
       description: "Scan a local skill, plugin, or package path for ClawHavoc-style poisoned-package indicators",
       parameters: Type.Object({
         path: Type.String(),
@@ -2860,14 +3391,13 @@ export default definePluginEntry({
         const report = await scanPath(params.path, { maxFiles: params.maxFiles ? Math.floor(params.maxFiles) : undefined });
         const scanReview = await getLatestScanReview(report.fingerprint);
         await appendAuditRecord({ kind: "tool_scan_path", input: params, report, scanReview });
-        return {
-          content: [{ type: "text", text: JSON.stringify({ ...report, currentReview: scanReview }, null, 2) }]
-        };
+        return jsonToolResult({ ...report, currentReview: scanReview });
       }
     });
 
     api.registerTool({
       name: "agent_passport_inspect_skill_artifact",
+      label: "agent_passport_inspect_skill_artifact",
       description: "Stage a local skill artifact into Passport quarantine, scan it, and report provenance plus any existing review state for the resulting fingerprint",
       parameters: Type.Object({
         path: Type.String(),
@@ -2885,14 +3415,13 @@ export default definePluginEntry({
           maxBytes: params.maxBytes ? Math.floor(params.maxBytes) : undefined
         });
         await appendAuditRecord({ kind: "tool_inspect_skill_artifact", input: params, ...result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_scan",
+      label: "agent_passport_review_scan",
       description: "Record a trust, review, or block decision for a scanned artifact path",
       parameters: Type.Object({
         path: Type.String(),
@@ -2909,14 +3438,13 @@ export default definePluginEntry({
           decision: params.decision,
           note: params.note
         });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_skill",
+      label: "agent_passport_review_skill",
       description: "Record a trust, review, or block decision for a tracked workspace skill by slug",
       parameters: Type.Object({
         slug: Type.String(),
@@ -2934,14 +3462,13 @@ export default definePluginEntry({
           note: params.note
         });
         await appendAuditRecord({ kind: "tool_review_skill", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_review_plugin",
+      label: "agent_passport_review_plugin",
       description: "Record a trust, review, or block decision for a Passport-recorded plugin by plugin id",
       parameters: Type.Object({
         pluginId: Type.String(),
@@ -2959,14 +3486,13 @@ export default definePluginEntry({
           note: params.note
         });
         await appendAuditRecord({ kind: "tool_review_plugin", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_preflight_artifact",
+      label: "agent_passport_preflight_artifact",
       description: "Evaluate whether a scanned artifact should be allowed to install or enable right now, based on scanner posture and recorded review state",
       parameters: Type.Object({
         path: Type.String()
@@ -2974,14 +3500,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await buildArtifactPreflight(params.path);
         await appendAuditRecord({ kind: "tool_preflight_artifact", input: params, ...result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_authorize_artifact_action",
+      label: "agent_passport_authorize_artifact_action",
       description: "Authorize a specific artifact action such as install or enable using scanner posture plus recorded review state",
       parameters: Type.Object({
         action: Type.Union([
@@ -2994,14 +3519,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await buildArtifactAuthorization({ action: params.action, targetPath: params.path });
         await appendAuditRecord({ kind: "tool_authorize_artifact", input: params, ...result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_run_artifact_action",
+      label: "agent_passport_run_artifact_action",
       description: "Run an install or enable command only if Passport authorizes that artifact action first",
       parameters: Type.Object({
         action: Type.Union([
@@ -3021,14 +3545,13 @@ export default definePluginEntry({
           dryRun: params.dryRun
         });
         await appendAuditRecord({ kind: "tool_run_artifact", input: params, ...result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_install_openclaw_plugin",
+      label: "agent_passport_install_openclaw_plugin",
       description: "Install a local OpenClaw plugin path only if Passport authorizes it first, with optional linked install and optional enable-after-install",
       parameters: Type.Object({
         path: Type.String(),
@@ -3040,14 +3563,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await installOpenClawPluginFromPath(params);
         await appendAuditRecord({ kind: "tool_install_openclaw_plugin", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_enable_openclaw_plugin",
+      label: "agent_passport_enable_openclaw_plugin",
       description: "Enable a local OpenClaw plugin path only if Passport authorizes it first",
       parameters: Type.Object({
         path: Type.String(),
@@ -3056,14 +3578,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await enableOpenClawPluginFromPath(params);
         await appendAuditRecord({ kind: "tool_enable_openclaw_plugin", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_update_openclaw_plugin",
+      label: "agent_passport_update_openclaw_plugin",
       description: "Update a Passport-recorded OpenClaw plugin only if Passport authorizes the update against the current recorded local source",
       parameters: Type.Object({
         pluginId: Type.String(),
@@ -3072,28 +3593,26 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await updateOpenClawPluginFromLedger(params);
         await appendAuditRecord({ kind: "tool_update_openclaw_plugin", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_plugin_installs",
+      label: "agent_passport_list_plugin_installs",
       description: "List Passport-recorded plugin installs for local OpenClaw plugin paths",
       parameters: Type.Object({
         pluginId: Type.Optional(Type.String())
       }, { additionalProperties: false }),
       async execute(_id, params) {
         const result = await listPluginInstalls({ pluginId: params.pluginId });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_plugin_state",
+      label: "agent_passport_plugin_state",
       description: "Return the combined install, drift, and review state for a Passport-recorded plugin",
       parameters: Type.Object({
         pluginId: Type.String()
@@ -3101,27 +3620,25 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await buildPluginState({ pluginId: params.pluginId });
         await appendAuditRecord({ kind: "tool_plugin_state", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_workspace_state",
+      label: "agent_passport_workspace_state",
       description: "Return a combined workspace view across tracked plugins and skills, including attention queues",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await buildWorkspaceState();
         await appendAuditRecord({ kind: "tool_workspace_state", result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_workspace_audit",
+      label: "agent_passport_workspace_audit",
       description: "Rank tracked plugins and skills for incident response after a ClawHavoc-style poisoning event",
       parameters: Type.Object({
         workspaceRoot: Type.Optional(Type.String()),
@@ -3140,14 +3657,13 @@ export default definePluginEntry({
         });
         const result = await buildWorkspaceAudit(auditOptions);
         await appendAuditRecord({ kind: "tool_workspace_audit", input: auditOptions, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify({ ...result, formatted: formatWorkspaceAudit(result) }, null, 2) }]
-        };
+        return jsonToolResult({ ...result, formatted: formatWorkspaceAudit(result) });
       }
     });
 
     api.registerTool({
       name: "agent_passport_check_plugin_drift",
+      label: "agent_passport_check_plugin_drift",
       description: "Re-scan the last Passport-recorded local source for a plugin and compare it against the fingerprint captured at install time",
       parameters: Type.Object({
         pluginId: Type.String()
@@ -3155,14 +3671,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await checkPluginInstallDrift({ pluginId: params.pluginId });
         await appendAuditRecord({ kind: "tool_check_plugin_drift", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_skill_state",
+      label: "agent_passport_skill_state",
       description: "Return the current install and review state for one tracked workspace skill",
       parameters: Type.Object({
         slug: Type.String()
@@ -3170,26 +3685,24 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await buildSkillState({ slug: params.slug });
         await appendAuditRecord({ kind: "tool_skill_state", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_list_skills_state",
+      label: "agent_passport_list_skills_state",
       description: "List tracked workspace skills with Passport state summaries",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await listSkillStates();
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_check_skill_drift",
+      label: "agent_passport_check_skill_drift",
       description: "Compare the current installed skill fingerprint against the last Passport-reviewed fingerprint for that skill slug",
       parameters: Type.Object({
         slug: Type.String()
@@ -3197,14 +3710,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await checkSkillDrift({ slug: params.slug });
         await appendAuditRecord({ kind: "tool_check_skill_drift", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_update_openclaw_skill",
+      label: "agent_passport_update_openclaw_skill",
       description: "Run openclaw skills update for one tracked workspace skill, then return the resulting Passport state",
       parameters: Type.Object({
         slug: Type.String(),
@@ -3213,14 +3725,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await updateOpenClawSkill({ slug: params.slug, dryRun: params.dryRun });
         await appendAuditRecord({ kind: "tool_update_openclaw_skill", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_update_all_openclaw_skills",
+      label: "agent_passport_update_all_openclaw_skills",
       description: "Run openclaw skills update --all for tracked workspace skills, then return a Passport summary of resulting states",
       parameters: Type.Object({
         dryRun: Type.Optional(Type.Boolean())
@@ -3228,64 +3739,59 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await updateAllOpenClawSkills({ dryRun: params.dryRun });
         await appendAuditRecord({ kind: "tool_update_all_openclaw_skills", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_skills_rereview_queue",
+      label: "agent_passport_list_skills_rereview_queue",
       description: "List tracked skills whose installed fingerprint drifted since the last Passport skill review and whose new fingerprint is not explicitly trusted",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await listSkillsNeedingRereview();
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_list_rereview_queue",
+      label: "agent_passport_list_rereview_queue",
       description: "List Passport-recorded plugins whose source drifted and whose new fingerprint is not yet explicitly trusted",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await listPluginsNeedingRereview();
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     });
 
     api.registerTool({
       name: "agent_passport_drift_sweep",
+      label: "agent_passport_drift_sweep",
       description: "Sweep the re-review queue and report what newly entered or resolved since the last sweep",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await sweepRereviewQueue();
         await appendAuditRecord({ kind: "tool_drift_sweep", result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_drift_alerts",
+      label: "agent_passport_drift_alerts",
       description: "Run a remembered-state drift sweep and return only whether new re-review alerts appeared, plus newly entered and resolved items",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const result = await buildDriftAlerts();
         await appendAuditRecord({ kind: "tool_drift_alerts", result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_scan_reviews",
+      label: "agent_passport_list_scan_reviews",
       description: "List recorded scan-review decisions, optionally filtered by artifact fingerprint or decision",
       parameters: Type.Object({
         fingerprint: Type.Optional(Type.String()),
@@ -3300,14 +3806,13 @@ export default definePluginEntry({
           fingerprint: params.fingerprint,
           decision: params.decision
         });
-        return {
-          content: [{ type: "text", text: JSON.stringify(reviews, null, 2) }]
-        };
+        return jsonToolResult(reviews);
       }
     });
 
     api.registerTool({
       name: "agent_passport_explain",
+      label: "agent_passport_explain",
       description: "Explain how Agent Passport would classify a proposed action",
       parameters: Type.Object({
         action: Type.String(),
@@ -3325,19 +3830,13 @@ export default definePluginEntry({
           decision
         });
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(decision, null, 2)
-            }
-          ]
-        };
+        return jsonToolResult(decision);
       }
     });
 
     api.registerTool({
       name: "agent_passport_grant_consent",
+      label: "agent_passport_grant_consent",
       description: "Grant temporary outbound-consent for a target",
       parameters: Type.Object({
         target: Type.String(),
@@ -3354,29 +3853,24 @@ export default definePluginEntry({
 
         await appendAuditRecord({ kind: "grant_consent", grant });
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(grant, null, 2)
-          }]
-        };
+        return jsonToolResult(grant);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_consents",
+      label: "agent_passport_list_consents",
       description: "List active temporary consent grants",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         const grants = await listConsents();
-        return {
-          content: [{ type: "text", text: JSON.stringify(grants, null, 2) }]
-        };
+        return jsonToolResult(grants);
       }
     });
 
     api.registerTool({
       name: "agent_passport_revoke_consent",
+      label: "agent_passport_revoke_consent",
       description: "Revoke temporary outbound-consent for a target",
       parameters: Type.Object({
         target: Type.String()
@@ -3384,14 +3878,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const result = await revokeConsent(params.target);
         await appendAuditRecord({ kind: "revoke_consent", target: params.target, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_request_consent",
+      label: "agent_passport_request_consent",
       description: "Create or fetch a pending consent request for an outbound action",
       parameters: Type.Object({
         target: Type.String(),
@@ -3405,14 +3898,13 @@ export default definePluginEntry({
       async execute(_id, params) {
         const request = await createConsentRequest(params);
         await appendAuditRecord({ kind: "request_consent", request });
-        return {
-          content: [{ type: "text", text: JSON.stringify(request, null, 2) }]
-        };
+        return jsonToolResult(request);
       }
     }, OPTIONAL_MUTATING_TOOL);
 
     api.registerTool({
       name: "agent_passport_list_requests",
+      label: "agent_passport_list_requests",
       description: "List pending or historical consent requests",
       parameters: Type.Object({
         status: Type.Optional(Type.Union([
@@ -3424,14 +3916,13 @@ export default definePluginEntry({
       }, { additionalProperties: false }),
       async execute(_id, params) {
         const requests = await listConsentRequests({ status: params.status ?? "pending" });
-        return {
-          content: [{ type: "text", text: JSON.stringify(requests, null, 2) }]
-        };
+        return jsonToolResult(requests);
       }
     });
 
     api.registerTool({
       name: "agent_passport_review_request",
+      label: "agent_passport_review_request",
       description: "Approve or deny a pending consent request",
       parameters: Type.Object({
         requestId: Type.String(),
@@ -3448,9 +3939,7 @@ export default definePluginEntry({
           note: params.note
         });
         await appendAuditRecord({ kind: "review_request", input: params, result });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-        };
+        return jsonToolResult(result);
       }
     }, OPTIONAL_MUTATING_TOOL);
   }

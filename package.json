@@ -36,21 +36,24 @@
     ],
     "compat": {
       "pluginApi": ">=1.2.0",
-      "builtWithOpenClawVersion": "2026.3.24"
+      "builtWithOpenClawVersion": "2026.3.28"
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.41",
-    "openclaw": "2026.3.24"
+    "openclaw": "2026.3.28"
   },
   "scripts": {
     "pack:dry": "npm pack --dry-run",
     "test": "node --import tsx --test --test-concurrency=1 tests/index.test.ts",
-    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/policy/inbound-dispatch.ts src/provenance.ts src/skill-inspection.ts src/trust-summary.ts src/workspace-audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts tests/inbound-dispatch.test.ts tests/skill-inspection.test.ts tests/trust-summary.test.ts tests/workspace-audit.test.ts"
+    "typecheck": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --strict --skipLibCheck --types node src/audit.ts src/consent.ts src/index.ts src/policy/inbound-dispatch.ts src/provenance.ts src/skill-inspection.ts src/trust-summary.ts src/workspace-audit.ts src/scanner/index.ts src/scanner/report.ts src/scanner/rules/*.ts tests/inbound-dispatch.test.ts tests/p0-regressions.test.ts tests/skill-inspection.test.ts tests/trust-summary.test.ts tests/workspace-audit.test.ts"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
+  },
+  "overrides": {
+    "axios": "<1.14.0"
   }
 }

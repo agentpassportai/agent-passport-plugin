@@ -4,13 +4,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import {
+  buildPluginApprovalExpiredMessage,
+  buildPluginApprovalRequestMessage,
+  buildPluginApprovalResolvedMessage
+} from "openclaw/plugin-sdk/approval-runtime";
 import { appendAuditRecord } from "../src/audit.js";
-import { createConsentRequest, listConsents, reviewConsentRequest } from "../src/consent.js";
+import { createConsentRequest, listConsentRequests, listConsents, reviewConsentRequest } from "../src/consent.js";
 import { recordPluginInstall } from "../src/install-ledger.js";
 import { listPluginsNeedingRereview } from "../src/rereview.js";
 import { recordScanReview } from "../src/review.js";
 import { scanPath } from "../src/scanner/index.js";
-import { updateOpenClawSkill } from "../src/index.js";
+import {
+  buildNativeToolApprovalRequirement,
+  handleNativeMessageSendingApproval,
+  isForwardedNativePluginApprovalMessage,
+  summarizePluginApprovalForwardingConfig,
+  updateOpenClawSkill
+} from "../src/index.js";
+import { evaluateOutboundCommunication } from "../src/policy/outbound-comms.js";
 
 async function makeTempRoot(prefix: string) {
   return await mkdtemp(join(tmpdir(), prefix));
@@ -218,6 +230,333 @@ test("consent requests approve into active grants and respect target aliases", a
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("native plugin approval keeps allow-once ephemeral and allow-always TTL-backed", async () => {
+  const root = await makeTempRoot("agent-passport-native-approval-");
+  const ledgerDir = join(root, ".openclaw", "agent-passport");
+  const consentStorePath = join(ledgerDir, "consents.json");
+
+  try {
+    await mkdir(ledgerDir, { recursive: true });
+
+    await withLedgerDir(ledgerDir, async () => {
+      const allowOnce = await buildNativeToolApprovalRequirement({
+        scope: "message.send",
+        target: "telegram:@clawbot",
+        decision: evaluateOutboundCommunication({
+          target: "telegram:@clawbot",
+          content: "send message"
+        }),
+        pluginCfg: {
+          mode: "enforce",
+          pathModes: {},
+          trustedTargets: [],
+          trustedTargetRules: [],
+          consentTtlMinutes: 15,
+          audit: { enabled: true, path: join(ledgerDir, "audit.jsonl") }
+        },
+        auditRecord: {
+          kind: "before_tool_call",
+          toolName: "message"
+        }
+      });
+
+      await allowOnce.requireApproval.onResolution?.("allow-once");
+
+      const requestsAfterOnce = await listConsentRequests({ status: "all", storePath: consentStorePath });
+      const grantsAfterOnce = await listConsents(consentStorePath);
+      assert.equal(requestsAfterOnce.length, 1);
+      assert.equal(requestsAfterOnce[0]?.status, "approved");
+      assert.equal(requestsAfterOnce[0]?.approvedGrantKey, undefined);
+      assert.equal(grantsAfterOnce.length, 0);
+
+      const allowAlways = await buildNativeToolApprovalRequirement({
+        scope: "sessions_send",
+        target: "discord:security-room",
+        decision: evaluateOutboundCommunication({
+          target: "discord:security-room",
+          content: "post comment"
+        }),
+        pluginCfg: {
+          mode: "enforce",
+          pathModes: {},
+          trustedTargets: [],
+          trustedTargetRules: [],
+          consentTtlMinutes: 15,
+          audit: { enabled: true, path: join(ledgerDir, "audit.jsonl") }
+        },
+        auditRecord: {
+          kind: "before_tool_call",
+          toolName: "sessions.send"
+        }
+      });
+
+      await allowAlways.requireApproval.onResolution?.("allow-always");
+
+      const requestsAfterAlways = await listConsentRequests({ status: "all", storePath: consentStorePath });
+      const grantsAfterAlways = await listConsents(consentStorePath);
+      assert.equal(requestsAfterAlways.length, 2);
+      assert.equal(requestsAfterAlways[1]?.status, "approved");
+      assert.ok(requestsAfterAlways[1]?.approvedGrantKey);
+      assert.equal(grantsAfterAlways.length, 1);
+      assert.equal(grantsAfterAlways[0]?.target, "discord:security-room");
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("native message_sending approval keeps allow-once ephemeral and allow-always TTL-backed", async () => {
+  const root = await makeTempRoot("agent-passport-native-message-");
+  const ledgerDir = join(root, ".openclaw", "agent-passport");
+  const consentStorePath = join(ledgerDir, "consents.json");
+
+  try {
+    await mkdir(ledgerDir, { recursive: true });
+
+    await withLedgerDir(ledgerDir, async () => {
+      const pluginCfg = {
+        mode: "enforce" as const,
+        pathModes: {},
+        trustedTargets: [],
+        trustedTargetRules: [],
+        consentTtlMinutes: 15,
+        audit: { enabled: true, path: join(ledgerDir, "audit.jsonl") }
+      };
+
+      const allowOnce = await handleNativeMessageSendingApproval({
+        config: {} as never,
+        pluginId: "agent-passport",
+        logger: { info() {}, warn() {} },
+        event: {
+          to: "telegram:@clawbot",
+          content: "send message",
+          metadata: { channel: "telegram", threadId: 42 }
+        },
+        ctx: {
+          channelId: "telegram",
+          accountId: "default",
+          conversationId: "12345"
+        },
+        target: "telegram:@clawbot",
+        decision: evaluateOutboundCommunication({
+          target: "telegram:@clawbot",
+          content: "send message"
+        }),
+        pluginCfg,
+        auditRecord: {
+          kind: "message_sending"
+        }
+      }, {
+        createGatewayClient: async () => ({
+          start() {},
+          async request(method: string) {
+            if (method === "plugin.approval.request") return { id: "plugreq_1" };
+            if (method === "plugin.approval.waitDecision") return { decision: "allow-once" };
+            throw new Error(`unexpected gateway method: ${method}`);
+          },
+          async stopAndWait() {}
+        } as never)
+      });
+
+      const requestsAfterOnce = await listConsentRequests({ status: "all", storePath: consentStorePath });
+      const grantsAfterOnce = await listConsents(consentStorePath);
+      assert.equal(allowOnce.allowed, true);
+      assert.equal(allowOnce.resolution, "allow-once");
+      assert.equal(requestsAfterOnce.length, 1);
+      assert.equal(requestsAfterOnce[0]?.status, "approved");
+      assert.equal(requestsAfterOnce[0]?.approvedGrantKey, undefined);
+      assert.equal(grantsAfterOnce.length, 0);
+
+      const allowAlways = await handleNativeMessageSendingApproval({
+        config: {} as never,
+        pluginId: "agent-passport",
+        logger: { info() {}, warn() {} },
+        event: {
+          to: "discord:security-room",
+          content: "post comment",
+          metadata: { channel: "discord" }
+        },
+        ctx: {
+          channelId: "discord",
+          accountId: "default",
+          conversationId: "ops-room"
+        },
+        target: "discord:security-room",
+        decision: evaluateOutboundCommunication({
+          target: "discord:security-room",
+          content: "post comment"
+        }),
+        pluginCfg,
+        auditRecord: {
+          kind: "message_sending"
+        }
+      }, {
+        createGatewayClient: async () => ({
+          start() {},
+          async request(method: string) {
+            if (method === "plugin.approval.request") return { id: "plugreq_2" };
+            if (method === "plugin.approval.waitDecision") return { decision: "allow-always" };
+            throw new Error(`unexpected gateway method: ${method}`);
+          },
+          async stopAndWait() {}
+        } as never)
+      });
+
+      const requestsAfterAlways = await listConsentRequests({ status: "all", storePath: consentStorePath });
+      const grantsAfterAlways = await listConsents(consentStorePath);
+      assert.equal(allowAlways.allowed, true);
+      assert.equal(allowAlways.resolution, "allow-always");
+      assert.equal(requestsAfterAlways.length, 2);
+      assert.equal(requestsAfterAlways[1]?.status, "approved");
+      assert.ok(requestsAfterAlways[1]?.approvedGrantKey);
+      assert.equal(grantsAfterAlways.length, 1);
+      assert.equal(grantsAfterAlways[0]?.target, "discord:security-room");
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("native message_sending approval keeps the Passport request pending when no approval route exists", async () => {
+  const root = await makeTempRoot("agent-passport-native-fallback-");
+  const ledgerDir = join(root, ".openclaw", "agent-passport");
+  const consentStorePath = join(ledgerDir, "consents.json");
+
+  try {
+    await mkdir(ledgerDir, { recursive: true });
+
+    await withLedgerDir(ledgerDir, async () => {
+      const result = await handleNativeMessageSendingApproval({
+        config: {} as never,
+        pluginId: "agent-passport",
+        logger: { info() {}, warn() {} },
+        event: {
+          to: "slack:security-team",
+          content: "post comment",
+          metadata: { channel: "slack" }
+        },
+        ctx: {
+          channelId: "slack",
+          accountId: "default",
+          conversationId: "C123"
+        },
+        target: "slack:security-team",
+        decision: evaluateOutboundCommunication({
+          target: "slack:security-team",
+          content: "post comment"
+        }),
+        pluginCfg: {
+          mode: "enforce",
+          pathModes: {},
+          trustedTargets: [],
+          trustedTargetRules: [],
+          consentTtlMinutes: 15,
+          audit: { enabled: true, path: join(ledgerDir, "audit.jsonl") }
+        },
+        auditRecord: {
+          kind: "message_sending"
+        }
+      }, {
+        createGatewayClient: async () => ({
+          start() {},
+          async request() {
+            return { id: "plugreq_3", decision: null };
+          },
+          async stopAndWait() {}
+        } as never)
+      });
+
+      const requests = await listConsentRequests({ status: "all", storePath: consentStorePath });
+      const grants = await listConsents(consentStorePath);
+      assert.equal(result.allowed, false);
+      assert.equal(result.routeAvailable, false);
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0]?.status, "pending");
+      assert.equal(grants.length, 0);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("forwarded native plugin approval notifications are exempt from recursive gating", () => {
+  const pendingMessage = buildPluginApprovalRequestMessage({
+    id: "plugreq_1",
+    request: {
+      title: "Agent Passport approval required",
+      description: "Review an outbound message",
+      pluginId: "agent-passport",
+      severity: "warning"
+    },
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now() + 30_000
+  }, Date.now());
+
+  const resolvedMessage = buildPluginApprovalResolvedMessage({
+    id: "plugreq_1",
+    decision: "allow-once",
+    ts: Date.now(),
+    resolvedBy: "operator"
+  });
+
+  const expiredMessage = buildPluginApprovalExpiredMessage({
+    id: "plugreq_1",
+    request: {
+      title: "Agent Passport approval required",
+      description: "Review an outbound message"
+    },
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now()
+  });
+
+  assert.equal(isForwardedNativePluginApprovalMessage(pendingMessage), true);
+  assert.equal(isForwardedNativePluginApprovalMessage(resolvedMessage), true);
+  assert.equal(isForwardedNativePluginApprovalMessage(expiredMessage), true);
+  assert.equal(isForwardedNativePluginApprovalMessage("normal outbound content"), false);
+});
+
+test("plugin approval forwarding summary distinguishes disabled, misconfigured, and configured gateway states", () => {
+  const disabled = summarizePluginApprovalForwardingConfig({} as never);
+  assert.equal(disabled.status, "disabled");
+  assert.match(disabled.reason, /enabled is false/i);
+
+  const misconfigured = summarizePluginApprovalForwardingConfig({
+    approvals: {
+      plugin: {
+        enabled: true,
+        mode: "targets",
+        targets: []
+      }
+    }
+  } as never);
+  assert.equal(misconfigured.status, "misconfigured");
+  assert.equal(misconfigured.mode, "targets");
+  assert.match(misconfigured.reason, /requires at least one/i);
+
+  const configured = summarizePluginApprovalForwardingConfig({
+    approvals: {
+      plugin: {
+        enabled: true,
+        mode: "both",
+        targets: [
+          {
+            channel: "discord",
+            to: "ops-room"
+          }
+        ],
+        agentFilter: ["primary"],
+        sessionFilter: ["agent:main:"]
+      }
+    }
+  } as never);
+  assert.equal(configured.status, "configured");
+  assert.equal(configured.mode, "both");
+  assert.equal(configured.usesSessionRoute, true);
+  assert.equal(configured.explicitTargetCount, 1);
+  assert.equal(configured.agentFilterCount, 1);
+  assert.equal(configured.sessionFilterCount, 1);
 });
 
 test("skill update stays blocked until the installed skill is explicitly trusted", async () => {

@@ -106,6 +106,8 @@ Passport also has runtime consent and audit controls on supported surfaces:
 
 `before_dispatch` is audit-first in Passport today. It records canonical inbound routing metadata and flags higher-risk group or prompt-injection-shaped traffic without claiming inbound enforcement.
 
+On OpenClaw `2026.3.28+`, `message_sending`, tool-gated `message.send`, and `sessions_send` flows use native plugin approvals when Passport is in `enforce` mode. `Allow once` stays ephemeral, while `Allow always` maps into Passport's TTL-backed consent ledger. If plugin approval routing is unavailable, Passport leaves the consent request pending for manual `/passport approve` review instead of silently dropping the fallback path.
+
 These hooks now register with explicit early priority so Passport's consent gate and inbound audit run deterministically before lower-priority plugin handlers on the same surfaces.
 
 ## What Agent Passport does not claim

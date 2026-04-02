@@ -39,6 +39,10 @@ export type PassportConsentStore = {
   requests: PassportConsentRequest[];
 };
 
+export type ReviewConsentRequestResult =
+  | { ok: false; error: string }
+  | { ok: true; request: PassportConsentRequest; grant: PassportConsentGrant | null };
+
 const storeLocks = new Map<string, Promise<unknown>>();
 
 function getLedgerDir() {
@@ -229,11 +233,12 @@ export async function listConsentRequests(input?: {
 export async function reviewConsentRequest(input: {
   requestId: string;
   decision: "approved" | "denied";
+  grantMode?: "ttl" | "none";
   ttlMinutes?: number;
   note?: string;
   storePath?: string;
-}) {
-  return mutateConsentStore((store) => {
+}): Promise<ReviewConsentRequestResult> {
+  return mutateConsentStore<ReviewConsentRequestResult>((store) => {
     const request = store.requests.find((item) => item.id === input.requestId);
     if (!request) {
       return { store, result: { ok: false as const, error: `Request not found: ${input.requestId}` } };
@@ -244,7 +249,7 @@ export async function reviewConsentRequest(input: {
     request.reviewNote = input.note;
 
     let grant: PassportConsentGrant | null = null;
-    if (input.decision === "approved") {
+    if (input.decision === "approved" && (input.grantMode ?? "ttl") === "ttl") {
       const now = Date.now();
       const target = normalizeTarget(request.target);
       const aliases = expandTargetAliases(request.target);
